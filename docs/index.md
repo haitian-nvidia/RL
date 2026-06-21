@@ -163,6 +163,13 @@ Off-policy distillation across mismatched tokenizers — build a (student, teach
 Deep dive into NeMo RL's architecture, APIs, and design decisions for scalable RL.
 :::
 
+:::{grid-item-card} {octicon}`globe` Sparse Delta Refit
+:link: design-docs/sparse-delta-refit
+:link-type: doc
+
+Configure and tune sparse delta weight updates for vLLM generation.
+:::
+
 :::{grid-item-card} {octicon}`bug` Debugging
 :link: debugging
 :link-type: doc
@@ -182,13 +189,6 @@ Optimize large language models with FP8 quantization for faster training and inf
 :link-type: doc
 
 Run quantization aware GRPO and distillation using NVIDIA ModelOpt (NVFP4, FP8).
-:::
-
-:::{grid-item-card} {octicon}`arrow-both` Delta-Compressed Refit
-:link: guides/delta-compressed-refit
-:link-type: doc
-
-Configure and validate delta-compressed collective refit for non-colocated vLLM generation.
 :::
 
 :::{grid-item-card} {octicon}`container` Docker Containers
@@ -274,7 +274,6 @@ guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
 guides/quantization-aware-rl.md
-guides/delta-compressed-refit.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
@@ -315,6 +314,7 @@ design-docs/uv.md
 design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
+design-docs/sparse-delta-refit.md
 design-docs/checkpointing.md
 design-docs/loss-functions.md
 design-docs/fsdp2-parallel-plan.md

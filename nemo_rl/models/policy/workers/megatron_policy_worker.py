@@ -15,6 +15,7 @@ import copy
 import gc
 import os
 import re
+import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -95,6 +96,10 @@ from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.weight_transfer import packed_weight_transfer_producer
 from nemo_rl.utils.weight_transfer_delta_tracker import (
     create_vllm_delta_transfer_tracker,
+)
+from nemo_rl.utils.weight_transfer_http import (
+    init_sparse_delta_baseline_from_iterator,
+    stream_sparse_delta_payloads_via_http,
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
@@ -267,6 +272,19 @@ class MegatronPolicyWorkerImpl(
         local_rank = int(gpu_ids[0])
         os.environ["LOCAL_RANK"] = str(local_rank)
         torch.cuda.set_device(local_rank)
+        if os.getenv("NRL_REFIT_DEBUG_RANKS"):
+            print(
+                "[megatron_init] "
+                f"rank={os.environ.get('RANK')} "
+                f"world_size={os.environ.get('WORLD_SIZE')} "
+                f"node_rank={os.environ.get('NODE_RANK')} "
+                f"local_rank={local_rank} "
+                f"ray_gpu_ids={gpu_ids} "
+                f"cuda_current_device={torch.cuda.current_device()} "
+                f"master={os.environ.get('MASTER_ADDR')}:{os.environ.get('MASTER_PORT')} "
+                f"host={os.uname().nodename}",
+                flush=True,
+            )
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
@@ -540,9 +558,6 @@ class MegatronPolicyWorkerImpl(
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
             "Megatron does not run cross-tokenizer distillation."
         )
-        if self.delta_weight_transfer_tracker is not None:
-            self.delta_weight_transfer_tracker.flush_baseline()
-
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):
@@ -1143,15 +1158,13 @@ class MegatronPolicyWorkerImpl(
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
+        # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
+        # Reuse shared iterator that appends FP8 KV/Q scales when enabled
         for name, tensor in self._iter_params_with_optional_kv_scales():
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
-        if self.rank == 0 and self.delta_weight_transfer_tracker is not None:
-            self.delta_weight_transfer_tracker.prewarm_baseline_from_metadata(
-                refit_param_info_hf
-            )
-
+        self._refit_param_info_for_delta_baseline = refit_param_info_hf
         return refit_param_info_hf
 
     def _collect_mtp_metrics(self, metrics: dict[str, Any]) -> None:
@@ -1187,6 +1200,87 @@ class MegatronPolicyWorkerImpl(
         elif hasattr(model, "config"):
             return model.config
         return None
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/prewarm_delta_baseline")
+    def prewarm_delta_baseline(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        _participate: bool = False,
+    ) -> None:
+        """Build a deferred delta baseline outside the critical refit path."""
+        if self.delta_weight_transfer_tracker is None:
+            return
+        if not self.delta_weight_transfer_tracker.should_prewarm_baseline():
+            return
+        has_pending_baseline = (
+            self.delta_weight_transfer_tracker.has_pending_full_sync_baseline()
+        )
+        if not has_pending_baseline and not _participate:
+            return
+
+        is_payload_source = self.is_refit_payload_source()
+        start = time.perf_counter()
+        mode = "cuda_export"
+        print(
+            "REFIT_BASELINE_PREWARM "
+            f"event=start worker=megatron rank={self.rank} mode={mode}",
+            flush=True,
+        )
+        params = self._iter_params_with_optional_kv_scales(
+            kv_scales=kv_scales,
+        )
+        if is_payload_source and has_pending_baseline:
+            self.delta_weight_transfer_tracker.snapshot_pending_full_sync_baseline(
+                params
+            )
+            self.delta_weight_transfer_tracker.on_sync_succeeded()
+        else:
+            for _ in params:
+                pass
+            if has_pending_baseline:
+                self.delta_weight_transfer_tracker.clear_pending_full_sync_baseline()
+        print(
+            "REFIT_BASELINE_PREWARM "
+            f"event=end worker=megatron rank={self.rank} mode={mode} "
+            f"seconds={time.perf_counter() - start:.6f}",
+            flush=True,
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/init_remote_sparse_delta_baseline")
+    def init_remote_sparse_delta_baseline(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> dict[str, Any]:
+        """Initialize the source-side baseline for remote sparse HTTP refit."""
+        params = self._iter_params_with_optional_kv_scales(kv_scales=kv_scales)
+        return init_sparse_delta_baseline_from_iterator(
+            params,
+            delta_tracker=self.delta_weight_transfer_tracker,
+            is_payload_source=self.is_refit_payload_source(fallback_to_rank=True),
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/stream_sparse_weights_via_http")
+    def stream_sparse_weights_via_http(
+        self,
+        refit_urls: list[str],
+        *,
+        api_key_env_var: Optional[str] = None,
+        timeout_s: float = 600.0,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> dict[str, Any]:
+        """Stream sparse vLLM delta payloads to remote HTTP refit endpoints."""
+        params = self._iter_params_with_optional_kv_scales(kv_scales=kv_scales)
+        return stream_sparse_delta_payloads_via_http(
+            params,
+            delta_tracker=self.delta_weight_transfer_tracker,
+            is_payload_source=self.is_refit_payload_source(fallback_to_rank=True),
+            refit_urls=refit_urls,
+            api_key_env_var=api_key_env_var,
+            timeout_s=timeout_s,
+        )
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -1275,12 +1369,21 @@ class MegatronPolicyWorkerImpl(
             for name, tensor in draft_weights:
                 yield f"draft.{name}", tensor
 
-        generation_cfg = self.cfg.get("generation")
-        if generation_cfg is None or generation_cfg.get("backend") != "vllm":
-            return
-        generation_cfg = cast(VllmConfig, generation_cfg)
-        kv_cache_dtype = generation_cfg.get("vllm_cfg", {}).get("kv_cache_dtype")
-        if kv_cache_dtype is None or not kv_cache_dtype.startswith("fp8"):
+        # Check whether FP8 KV cache is enabled.
+        use_fp8_kv_cache = False
+        if (
+            "generation" in self.cfg
+            and self.cfg["generation"] is not None
+            and self.cfg["generation"]["backend"] == "vllm"
+        ):
+            generation_cfg = cast(VllmConfig, self.cfg["generation"])
+            use_fp8_kv_cache = (
+                "vllm_cfg" in generation_cfg
+                and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
+                and generation_cfg["vllm_cfg"]["kv_cache_dtype"].startswith("fp8")
+            )
+
+        if not use_fp8_kv_cache:
             return
 
         # Append KV (and potentially Q) scale entries to match metadata.
@@ -1326,11 +1429,22 @@ class MegatronPolicyWorkerImpl(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
         """Broadcast the weights for collective communication."""
+        params = self._iter_params_with_optional_kv_scales(kv_scales=kv_scales)
+        model_update_group = getattr(self, "model_update_group", None)
+        if model_update_group is None:
+            for _ in params:
+                pass
+            return
+
         packed_weight_transfer_producer(
-            iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
-            group=self.model_update_group,
+            iterator=params,
+            group=model_update_group,
             src=0,
-            delta_tracker=self.delta_weight_transfer_tracker,
+            delta_tracker=(
+                self.delta_weight_transfer_tracker
+                if self.is_refit_payload_source()
+                else None
+            ),
         )
 
     def prepare_for_lp_inference(self):

@@ -23,9 +23,12 @@ when the cluster size is insufficient for the specified parallelism configuratio
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.utils.weight_transfer_delta_tracker import DeltaCompressionTracker
 
 
 def create_mock_cluster(world_size: int):
@@ -52,6 +55,96 @@ def create_mock_tokenizer():
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
     return tokenizer
+
+
+class _TwoLinearModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.a = torch.nn.Linear(4, 4, bias=False)
+        self.b = torch.nn.Linear(4, 4, bias=False)
+
+
+def _delta_tracker_with_baseline(
+    model: torch.nn.Module,
+    names: list[str],
+) -> DeltaCompressionTracker:
+    tracker = DeltaCompressionTracker(
+        {
+            "full_sync_interval": 3,
+            "sparse_bucket_size_bytes": 1024,
+            "dtype": "float32",
+            "index_encoding": "indices",
+        }
+    )
+    tracker.committed_syncs = 1
+    params = [param for param in model.parameters() if param.requires_grad]
+    for name, param in zip(names, params, strict=True):
+        tracker.baseline[name] = torch.zeros_like(param.detach(), device="cpu")
+    return tracker
+
+
+def test_refit_benchmark_sparse_update_records_only_matching_baseline_names(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    worker = object.__new__(AbstractPolicyWorker)
+    worker.rank = 0
+    worker.model = _TwoLinearModel()
+
+    worker.delta_weight_transfer_tracker = _delta_tracker_with_baseline(
+        worker.model,
+        ["hf_b.weight", "hf_a.weight"],
+    )
+    worker.apply_refit_benchmark_sparse_update(
+        fraction=0.25,
+        delta=1.0,
+        seed=1,
+    )
+    assert worker.delta_weight_transfer_tracker._pending_updates == {}
+
+    worker.model = _TwoLinearModel()
+    worker.delta_weight_transfer_tracker = _delta_tracker_with_baseline(
+        worker.model,
+        ["a.weight", "b.weight"],
+    )
+    worker.apply_refit_benchmark_sparse_update(
+        fraction=0.25,
+        delta=1.0,
+        seed=1,
+    )
+    assert set(worker.delta_weight_transfer_tracker._pending_updates) == {
+        "a.weight",
+        "b.weight",
+    }
+
+
+def test_policy_prepare_for_lp_inference_waits_for_delta_baseline(monkeypatch):
+    events = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name: str):
+            events.append(("run", method_name))
+            return ["lp-inference-ref"]
+
+    def fake_ray_get(refs):
+        events.append(("get", refs))
+        return refs
+
+    monkeypatch.setattr("nemo_rl.models.policy.lm_policy.ray.get", fake_ray_get)
+    policy = object.__new__(Policy)
+    policy.worker_group = WorkerGroup()
+    policy._delta_baseline_prewarm_refs = ["baseline-ref"]
+    policy._delta_baseline_prewarm_submitted = True
+
+    Policy.prepare_for_lp_inference(policy)
+
+    assert events == [
+        ("get", ["baseline-ref"]),
+        ("run", "prepare_for_lp_inference"),
+        ("get", ["lp-inference-ref"]),
+    ]
+    assert policy._delta_baseline_prewarm_refs == []
+    assert not policy._delta_baseline_prewarm_submitted
 
 
 def create_dtensor_config(

@@ -1634,7 +1634,9 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
     assert master_config.grpo["skip_reference_policy_logprobs_calculation"] is True
 
 
-def test_refit_policy_generation_non_colocated_offloads_and_restores(monkeypatch):
+def test_refit_policy_generation_non_colocated_vllm_defers_training_restore(
+    monkeypatch,
+):
     from nemo_rl.algorithms import grpo as grpo_mod
 
     calls = []
@@ -1650,6 +1652,10 @@ def test_refit_policy_generation_non_colocated_offloads_and_restores(monkeypatch
 
         def prepare_for_training(self):
             calls.append("prepare_for_training")
+
+        def prewarm_delta_baseline(self, kv_scales=None):
+            calls.append(("prewarm_delta_baseline", kv_scales))
+            return ["prewarm-ok"]
 
     class DummyGeneration:
         def update_weights_from_collective(self):
@@ -1669,7 +1675,7 @@ def test_refit_policy_generation_non_colocated_offloads_and_restores(monkeypatch
         "offload_before_refit",
         ("broadcast_weights_for_collective", kv_scales),
         "update_weights_from_collective",
-        "prepare_for_training",
+        ("prewarm_delta_baseline", kv_scales),
     ]
 
 

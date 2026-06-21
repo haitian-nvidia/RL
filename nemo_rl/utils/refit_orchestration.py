@@ -12,13 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Constants for generation backend names.
+from typing import Any
 
-These should be used instead of raw string literals when checking or
-comparing backend names in config values.
-"""
+import ray
 
-VLLM_BACKEND = "vllm"
-VLLM_HTTP_BACKEND = "vllm_http"
-SGLANG_BACKEND = "sglang"
-MEGATRON_BACKEND = "megatron"
+
+def queue_baseline_prewarm_after_source_broadcast(
+    policy: Any,
+    futures_train: list[Any],
+    *,
+    kv_scales: dict[str, float] | None = None,
+) -> None:
+    """Wait for the policy weight broadcast, then build the delta baseline.
+
+    Runs while the generation workers may still be draining their collective
+    work, so the baseline prewarm overlaps with the inference-side update.
+    """
+    if not futures_train:
+        return
+
+    ray.get(futures_train)
+    policy.prewarm_delta_baseline(kv_scales=kv_scales)

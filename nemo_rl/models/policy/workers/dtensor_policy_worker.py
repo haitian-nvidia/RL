@@ -93,9 +93,6 @@ from nemo_rl.utils.native_checkpoint import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.weight_transfer import packed_weight_transfer_producer
-from nemo_rl.utils.weight_transfer_delta_tracker import (
-    create_vllm_delta_transfer_tracker,
-)
 
 
 def _attach_context_parallel_hooks(model: nn.Module) -> None:
@@ -232,9 +229,6 @@ class DTensorPolicyWorkerImpl(
         configure_dynamo_cache()
 
         self.cfg = config
-        self.delta_weight_transfer_tracker = create_vllm_delta_transfer_tracker(
-            self.cfg.get("generation")
-        )
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
         self.rank = torch.distributed.get_rank()
@@ -584,9 +578,6 @@ class DTensorPolicyWorkerImpl(
         check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        if self.delta_weight_transfer_tracker is not None:
-            self.delta_weight_transfer_tracker.flush_baseline()
-
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -1812,11 +1803,6 @@ class DTensorPolicyWorkerImpl(
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
             state_dict_info[name] = (tensor.shape, self.dtype)
 
-        if self.rank == 0 and self.delta_weight_transfer_tracker is not None:
-            self.delta_weight_transfer_tracker.prewarm_baseline_from_metadata(
-                state_dict_info
-            )
-
         return state_dict_info
 
     @torch.no_grad()
@@ -1895,21 +1881,20 @@ class DTensorPolicyWorkerImpl(
             )
             self.model = self.move_to_cuda(self.model)
 
-        def _prepare_refit_tensor(tensor, dtype):
+        def _dtensor_post_iter_func(tensor, dtype):
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
             tensor = tensor.to(dtype, non_blocking=True)
             return tensor
 
-        def _params_iterator():
+        def collective_params():
             for name, tensor in self.model.state_dict().items():
-                yield name, _prepare_refit_tensor(tensor, self.dtype)
+                yield name, _dtensor_post_iter_func(tensor, self.dtype)
 
         packed_weight_transfer_producer(
-            iterator=_params_iterator(),
+            iterator=collective_params(),
             group=self.model_update_group,
             src=0,
-            delta_tracker=self.delta_weight_transfer_tracker,
         )
 
         # Manually move model to cpu for cpu offload case

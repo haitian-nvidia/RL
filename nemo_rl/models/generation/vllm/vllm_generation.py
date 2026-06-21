@@ -526,6 +526,7 @@ class VllmGeneration(GenerationInterface):
                 "port": port,
                 "world_size": world_size,
                 "train_world_size": train_world_size,
+                "local_world_size": workers_per_group,
             },
         )
 
@@ -839,6 +840,17 @@ class VllmGeneration(GenerationInterface):
 
         # Wait for all futures to complete
         ray.get(futures)
+
+    def report_refit_server_base_urls(self) -> list[str]:
+        """Return base URLs for vLLM workers exposing HTTP sparse refit."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        futures = self.worker_group.run_all_workers_single_data(
+            "report_refit_server_base_url",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return [url for url in ray.get(futures) if url]
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""

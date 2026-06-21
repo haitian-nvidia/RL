@@ -13,58 +13,63 @@
 # limitations under the License.
 
 import contextlib
-import itertools
 import json
 import os
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from functools import lru_cache
 from typing import Any, Literal, cast
 
 import torch
-
-from nemo_rl.utils.packed_tensor import get_num_buffers
 
 G_PAYLOAD_ALIGNMENT_BYTES = 8
 G_PACKED_INDICES_NAME = "__packed_indices__"
 G_PACKED_VALUES_NAME = "__packed_values__"
 G_INDEX_START_KEY = "index_start"
 G_INDEX_END_KEY = "index_end"
-G_DEFAULT_SPARSE_ENCODE_COALESCE_BYTES = 256 * 1024**2
-G_DEFAULT_BASELINE_PREWARM_CHUNK_BYTES = 256 * 1024**2
-G_DEFAULT_BASELINE_PREWARM_MAX_BYTES = 128 * 1024**3
-G_DEFAULT_BASELINE_STAGE_COALESCE_BYTES = 256 * 1024**2
-G_DEFAULT_BASELINE_MMAP_MIN_BYTES = 128 * 1024**3
-G_DEFAULT_BASELINE_MMAP_WRITE_WORKERS = 4
-G_BASELINE_STAGE_FREE_MEMORY_FRACTION = 0.125
 
 DeltaCompressionTransport = Literal["dense", "sparse_indices"]
 WeightTransferKind = Literal["full", "delta", "done"]
-
 G_DENSE_TRANSPORT: DeltaCompressionTransport = "dense"
 G_SPARSE_INDICES_TRANSPORT: DeltaCompressionTransport = "sparse_indices"
 G_FULL_UPDATE_KIND: WeightTransferKind = "full"
 G_DELTA_UPDATE_KIND: WeightTransferKind = "delta"
 G_TRANSFER_DONE_KIND: WeightTransferKind = "done"
 
-G_FLOAT_DTYPE_MAP = {
-    "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-    "float16": torch.float16,
-    "fp32": torch.float32,
-    "bf16": torch.bfloat16,
-    "fp16": torch.float16,
-}
+NamedTensor = tuple[str, torch.Tensor]
+TensorBatch = list[NamedTensor]
+WeightLoadFunc = Callable[[TensorBatch], None]
+TensorPayload = tuple[TensorBatch, DeltaCompressionTransport, list[dict[str, Any]]]
+PayloadEvents = tuple[torch.cuda.Event, ...]
+QueuedPayload = tuple[WeightTransferKind, TensorPayload, PayloadEvents]
+SparseBucketPayload = tuple[TensorPayload, PayloadEvents]
+HeaderRefs = tuple[torch.Tensor, torch.Tensor | None]
+TensorMetadata = Mapping[str, tuple[Iterable[int], torch.dtype]]
+
+G_REFIT_PREWARM_DELTA_BASELINE_ENV = "NRL_REFIT_PREWARM_DELTA_BASELINE"
+G_REFIT_BASELINE_IN_MEMORY_ENV = "NRL_REFIT_BASELINE_IN_MEMORY"
+G_REFIT_BASELINE_MMAP_DIR_ENV = "NRL_REFIT_BASELINE_MMAP_DIR"
+G_REFIT_DIRECT_SPARSE_VLLM_LOAD_ENV = "NRL_REFIT_DIRECT_SPARSE_VLLM_LOAD"
 
 G_TENSOR_DTYPE_MAP = {
-    "bool": torch.bool,
-    "uint8": torch.uint8,
-    "int8": torch.int8,
-    "int16": torch.int16,
-    "int32": torch.int32,
-    "int64": torch.int64,
     "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
+    "fp32": torch.float32,
+    "float": torch.float32,
     "float16": torch.float16,
+    "fp16": torch.float16,
+    "half": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
     "float64": torch.float64,
+    "double": torch.float64,
+    "int64": torch.int64,
+    "long": torch.int64,
+    "int32": torch.int32,
+    "int": torch.int32,
+    "int16": torch.int16,
+    "short": torch.int16,
+    "int8": torch.int8,
+    "uint8": torch.uint8,
+    "bool": torch.bool,
 }
 
 for _float8_dtype_name in (
@@ -78,87 +83,88 @@ for _float8_dtype_name in (
         G_TENSOR_DTYPE_MAP[_float8_dtype_name] = _float8_dtype
 del _float8_dtype, _float8_dtype_name
 
-NamedTensor = tuple[str, torch.Tensor]
-TensorBatch = list[NamedTensor]
-WeightLoadFunc = Callable[[TensorBatch], None]
-TensorPayload = tuple[TensorBatch, DeltaCompressionTransport, list[dict[str, Any]]]
-PayloadEvents = tuple[torch.cuda.Event, ...]
-QueuedPayload = tuple[WeightTransferKind, TensorPayload, PayloadEvents]
-SparseBucketPayload = tuple[TensorPayload, PayloadEvents]
-HeaderRefs = tuple[torch.Tensor, torch.Tensor | None]
-TensorMetadata = Mapping[str, tuple[Iterable[int], torch.dtype]]
-
-G_REFIT_SPARSE_ENCODE_COALESCE_BYTES_ENV = "NRL_REFIT_SPARSE_ENCODE_COALESCE_BYTES"
-G_REFIT_PREWARM_DELTA_BASELINE_ENV = "NRL_REFIT_PREWARM_DELTA_BASELINE"
-G_REFIT_BASELINE_PREWARM_CHUNK_BYTES_ENV = "NRL_REFIT_BASELINE_PREWARM_CHUNK_BYTES"
-G_REFIT_BASELINE_PREWARM_MAX_BYTES_ENV = "NRL_REFIT_BASELINE_PREWARM_MAX_BYTES"
-G_REFIT_BASELINE_STAGE_COALESCE_BYTES_ENV = "NRL_REFIT_BASELINE_STAGE_COALESCE_BYTES"
-G_REFIT_BASELINE_MMAP_MIN_BYTES_ENV = "NRL_REFIT_BASELINE_MMAP_MIN_BYTES"
-G_REFIT_BASELINE_MMAP_DIR_ENV = "NRL_REFIT_BASELINE_MMAP_DIR"
-G_REFIT_BASELINE_MMAP_PENDING_BYTES_ENV = "NRL_REFIT_BASELINE_MMAP_PENDING_BYTES"
-G_REFIT_BASELINE_MMAP_WRITE_WORKERS_ENV = "NRL_REFIT_BASELINE_MMAP_WRITE_WORKERS"
-
-G_HEADER_KIND_TO_CODE = {
-    G_TRANSFER_DONE_KIND: 0,
-    G_FULL_UPDATE_KIND: 1,
-    G_DELTA_UPDATE_KIND: 2,
-}
-G_HEADER_CODE_TO_KIND = {code: kind for kind, code in G_HEADER_KIND_TO_CODE.items()}
-G_HEADER_TRANSPORT_TO_CODE = {
-    G_DENSE_TRANSPORT: 0,
-    G_SPARSE_INDICES_TRANSPORT: 1,
-}
-G_HEADER_CODE_TO_TRANSPORT = {
-    code: transport for transport, code in G_HEADER_TRANSPORT_TO_CODE.items()
-}
-
 
 def env_flag(name: str, *, default: bool = False) -> bool:
     value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    return (
+        default
+        if value is None
+        else value.strip().lower() in {"1", "true", "yes", "on"}
+    )
 
 
-def env_int(name: str, *, default: int) -> int:
+def env_int(name: str, *, default: int, min_value: int | None = None) -> int:
     value = os.getenv(name)
     if value is None or not value.strip():
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        raise ValueError(f"Expected integer value for {name}.") from None
+        parsed = default
+    else:
+        try:
+            parsed = int(value)
+        except ValueError:
+            raise ValueError(f"Expected integer value for {name}.") from None
+    if min_value is not None and parsed < min_value:
+        raise ValueError(f"{name} must be >= {min_value}.")
+    return parsed
 
 
-def metadata_numel(shape: tuple[int, ...]) -> int:
-    numel = 1
-    for dim in shape:
-        numel *= dim
-    return numel
+def config_to_dict(config: Any | None) -> dict[str, Any]:
+    if config is None:
+        return {}
+    if hasattr(config, "model_dump"):
+        return dict(config.model_dump())
+    return dict(config)
+
+
+def config_env_flag(
+    config: Mapping[str, Any],
+    key: str,
+    *,
+    env_name: str,
+    default: bool,
+) -> bool:
+    if key in config:
+        return bool(config[key])
+    return env_flag(env_name, default=default)
+
+
+def is_refit_receiver_timing(key: str, value: Any) -> bool:
+    return (
+        key.startswith("receiver_")
+        and key.endswith("_s")
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    )
 
 
 def dtype_itemsize(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
 
-def memory_limited_stage_bytes(
-    device: torch.device | int | str | None,
-    requested_bytes: int,
-) -> int:
-    if requested_bytes <= 0 or not torch.cuda.is_available():
-        return requested_bytes
+def dtype_to_name(dtype: torch.dtype) -> str:
+    return str(dtype).split(".", 1)[-1]
 
-    normalized_device = normalize_device(device)
-    if normalized_device is not None and normalized_device.type != "cuda":
-        return requested_bytes
 
-    free_bytes, _ = torch.cuda.mem_get_info(normalized_device)
-    free_memory_cap = int(free_bytes * G_BASELINE_STAGE_FREE_MEMORY_FRACTION)
-    return min(requested_bytes, free_memory_cap)
+def dtype_from_name(name: str) -> torch.dtype:
+    try:
+        return G_TENSOR_DTYPE_MAP[name]
+    except KeyError:
+        raise ValueError(f"Unsupported tensor dtype {name!r}") from None
+
+
+@lru_cache(maxsize=1)
+def get_target_packed_tensor_size() -> int:
+    memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.02")
+    device = torch.device("cuda")
+    props = torch.cuda.get_device_properties(device)
+    return min(int(props.total_memory * float(memory_ratio)), 5 * 1024**3)
+
+
+@lru_cache(maxsize=1)
+def get_num_buffers() -> int:
+    return int(os.getenv("NRL_REFIT_NUM_BUFFERS", "2"))
 
 
 def pack_named_tensors(tensors: TensorBatch) -> tuple[torch.Tensor, list[dict]]:
-    """Pack tensors with mixed dtypes into one uint8 tensor."""
     chunks = []
     entries = []
     for name, tensor in tensors:
@@ -172,79 +178,33 @@ def pack_named_tensors(tensors: TensorBatch) -> tuple[torch.Tensor, list[dict]]:
         entries.append(
             {
                 "name": name,
-                "shape": list(tensor.shape),
+                "shape": [int(dim) for dim in tensor.shape],
                 "dtype": dtype_to_name(tensor.dtype),
                 "byte_size": byte_size,
                 "wire_byte_size": byte_size + pad,
             }
         )
+    if not chunks:
+        return torch.empty(0, dtype=torch.uint8), []
     return torch.cat(chunks, dim=0), entries
 
 
 def unpack_named_tensors(
-    payload: torch.Tensor, entries: list[dict[str, Any]]
+    payload: torch.Tensor,
+    entries: list[dict[str, Any]],
 ) -> TensorBatch:
-    """Unpack a uint8 transfer payload according to header metadata."""
     byte_views = payload.split_with_sizes(
         [int(entry["wire_byte_size"]) for entry in entries]
     )
     return [
         (
-            entry["name"],
+            str(entry["name"]),
             byte_view[: int(entry["byte_size"])]
-            .view(dtype_from_name(entry["dtype"]))
-            .view(tuple(entry["shape"])),
+            .view(dtype_from_name(str(entry["dtype"])))
+            .view(tuple(int(dim) for dim in entry["shape"])),
         )
         for entry, byte_view in zip(entries, byte_views, strict=True)
     ]
-
-
-@contextlib.contextmanager
-def additive_weight_load_context(target_tensors: Iterable[torch.Tensor]):
-    """Make weight loaders add into model tensors instead of overwriting them."""
-    original_copy = torch.Tensor.copy_
-    original_fill = torch.Tensor.fill_
-    original_setitem = torch.Tensor.__setitem__
-    target_storage_ptrs = {
-        tensor.untyped_storage().data_ptr() for tensor in target_tensors
-    }
-
-    def should_add(tensor: torch.Tensor) -> bool:
-        return (
-            tensor.dtype.is_floating_point
-            and tensor.untyped_storage().data_ptr() in target_storage_ptrs
-        )
-
-    def additive_copy(self, src, non_blocking=False):
-        if should_add(self):
-            self.add_(src.to(self.device, self.dtype, non_blocking=non_blocking))
-            return self
-        return original_copy(self, src, non_blocking=non_blocking)
-
-    def additive_fill(self, value, *args, **kwargs):
-        if should_add(self):
-            self.add_(value)
-            return self
-        return original_fill(self, value, *args, **kwargs)
-
-    def additive_setitem(self, index, value):
-        destination = self[index]
-        if should_add(destination):
-            if isinstance(value, torch.Tensor):
-                value = value.to(device=destination.device, dtype=destination.dtype)
-            destination.add_(value)
-            return
-        return original_setitem(self, index, value)
-
-    torch.Tensor.copy_ = cast(Any, additive_copy)
-    torch.Tensor.fill_ = cast(Any, additive_fill)
-    torch.Tensor.__setitem__ = cast(Any, additive_setitem)
-    try:
-        yield
-    finally:
-        torch.Tensor.copy_ = cast(Any, original_copy)
-        torch.Tensor.fill_ = cast(Any, original_fill)
-        torch.Tensor.__setitem__ = cast(Any, original_setitem)
 
 
 def wire_bytes(tensors: TensorBatch) -> int:
@@ -255,44 +215,75 @@ def wire_bytes(tensors: TensorBatch) -> int:
     )
 
 
+@contextlib.contextmanager
+def additive_weight_load_context(target_tensors: Iterable[torch.Tensor]):
+    """Make vLLM loader copy/fill calls add deltas into existing tensors."""
+    target_storage_ptrs = {
+        ptr
+        for tensor in target_tensors
+        if (ptr := _tensor_storage_ptr(tensor)) is not None
+    }
+    old_copy = torch.Tensor.copy_
+    old_fill = torch.Tensor.fill_
+
+    def copy_add(self, src, non_blocking=False):
+        if _tensor_storage_ptr(self) in target_storage_ptrs and torch.is_tensor(src):
+            return self.add_(src.to(device=self.device, dtype=self.dtype), alpha=1)
+        return old_copy(self, src, non_blocking=non_blocking)
+
+    def fill_add(self, value, *args, **kwargs):
+        if _tensor_storage_ptr(self) in target_storage_ptrs:
+            return self.add_(value)
+        return old_fill(self, value, *args, **kwargs)
+
+    torch.Tensor.copy_ = copy_add  # pyrefly: ignore[bad-assignment]
+    torch.Tensor.fill_ = fill_add  # pyrefly: ignore[bad-assignment]
+    try:
+        yield
+    finally:
+        torch.Tensor.copy_ = old_copy
+        torch.Tensor.fill_ = old_fill
+
+
+def _tensor_storage_ptr(tensor: torch.Tensor) -> int | None:
+    try:
+        return int(tensor.untyped_storage().data_ptr())
+    except RuntimeError:
+        return None
+
+
+def _wire_bytes(item: NamedTensor) -> int:
+    tensor = item[1]
+    return int(tensor.numel() * tensor.element_size())
+
+
 def next_chunk(
     iterator: Iterator[NamedTensor],
-    byte_cap: int,
+    target_chunk_bytes: int,
     *,
     pending_item: NamedTensor | None = None,
 ) -> tuple[TensorBatch, NamedTensor | None]:
     chunk: TensorBatch = []
     chunk_bytes = 0
-    items: Iterable[NamedTensor] = iterator
     if pending_item is not None:
-        items = itertools.chain((pending_item,), iterator)
-    for item in items:
-        tensor_bytes = item[1].numel() * item[1].element_size()
-        if chunk and chunk_bytes + tensor_bytes > byte_cap:
+        chunk.append(pending_item)
+        chunk_bytes = _wire_bytes(pending_item)
+        pending_item = None
+    for item in iterator:
+        item_bytes = _wire_bytes(item)
+        if chunk and chunk_bytes + item_bytes > target_chunk_bytes:
             return chunk, item
         chunk.append(item)
-        chunk_bytes += tensor_bytes
+        chunk_bytes += item_bytes
+        if chunk_bytes >= target_chunk_bytes:
+            break
     return chunk, None
 
 
-def advance_chunk(
-    iterator: Iterator[NamedTensor],
-    byte_cap: int,
-    *,
-    pending_item: NamedTensor | None = None,
-) -> tuple[NamedTensor | None, bool]:
-    chunk_bytes = 0
-    consumed_item = False
-    items: Iterable[NamedTensor] = iterator
-    if pending_item is not None:
-        items = itertools.chain((pending_item,), iterator)
-    for item in items:
-        tensor_bytes = item[1].numel() * item[1].element_size()
-        if consumed_item and chunk_bytes + tensor_bytes > byte_cap:
-            return item, False
-        consumed_item = True
-        chunk_bytes += tensor_bytes
-    return None, True
+def target_chunk_size() -> int:
+    if torch.cuda.is_available():
+        return int(get_target_packed_tensor_size())
+    return int(os.getenv("NRL_REFIT_CPU_TARGET_PACKED_TENSOR_SIZE", 64 * 1024**2))
 
 
 def broadcast_header(
@@ -302,8 +293,9 @@ def broadcast_header(
     src: int,
     device: torch.device | int | str,
 ) -> tuple[dict[str, Any], HeaderRefs]:
+    is_src = int(group.rank) == src
     encoded = _encode_header_metadata(header)
-    if group.rank == src:
+    if is_src:
         control_tensor = torch.tensor(
             _header_control_values(header, len(encoded)),
             dtype=torch.int64,
@@ -312,12 +304,20 @@ def broadcast_header(
     else:
         control_tensor = torch.empty(4, dtype=torch.int64, device=device)
     group.broadcast(control_tensor, src=src)
-    kind, transport, payload_numel, metadata_len = decode_header_control(control_tensor)
+
+    # The source already knows every header value, so skip the device->host
+    # readback of the control tensor and only decode it on receivers.
+    if is_src:
+        metadata_len = len(encoded)
+    else:
+        kind, transport, payload_numel, metadata_len = _decode_header_control(
+            control_tensor
+        )
 
     metadata_tensor = None
     metadata: dict[str, Any] = {}
     if metadata_len > 0:
-        if group.rank == src:
+        if is_src:
             metadata_tensor = torch.tensor(
                 list(encoded), dtype=torch.uint8, device=device
             )
@@ -326,12 +326,12 @@ def broadcast_header(
                 metadata_len, dtype=torch.uint8, device=device
             )
         group.broadcast(metadata_tensor, src=src)
-        if group.rank != src:
+        if not is_src:
             metadata = json.loads(
                 metadata_tensor.cpu().numpy().tobytes().decode("utf-8")
             )
 
-    if group.rank == src:
+    if is_src:
         received_header = dict(header)
     else:
         received_header = {
@@ -346,40 +346,54 @@ def broadcast_header(
 
 
 def _header_control_values(header: Mapping[str, Any], metadata_len: int) -> list[int]:
-    kind = header["kind"]
-    if kind not in G_HEADER_KIND_TO_CODE:
-        raise ValueError(f"Unsupported weight transfer header kind: {kind}")
-    transport = header.get("transport", G_DENSE_TRANSPORT)
-    if transport not in G_HEADER_TRANSPORT_TO_CODE:
-        raise ValueError(f"Unsupported weight transfer header transport: {transport}")
+    kind_code = {
+        G_TRANSFER_DONE_KIND: 0,
+        G_FULL_UPDATE_KIND: 1,
+        G_DELTA_UPDATE_KIND: 2,
+    }.get(header["kind"])
+    if kind_code is None:
+        raise ValueError(f"Unsupported weight transfer header kind: {header['kind']!r}")
+
+    transport_code = {
+        G_DENSE_TRANSPORT: 0,
+        G_SPARSE_INDICES_TRANSPORT: 1,
+    }.get(header.get("transport", G_DENSE_TRANSPORT))
+    if transport_code is None:
+        raise ValueError(
+            f"Unsupported weight transfer header transport: {header.get('transport')!r}"
+        )
     return [
-        G_HEADER_KIND_TO_CODE[kind],
-        G_HEADER_TRANSPORT_TO_CODE[transport],
+        kind_code,
+        transport_code,
         int(header.get("payload_numel", 0)),
         metadata_len,
     ]
 
 
-def decode_header_control(
+def _decode_header_control(
     control_tensor: torch.Tensor,
-) -> tuple[WeightTransferKind, DeltaCompressionTransport, int, int]:
+) -> tuple[WeightTransferKind, str, int, int]:
     kind_code, transport_code, payload_numel, metadata_len = [
         int(value) for value in control_tensor.cpu().tolist()
     ]
+    kind_by_code: dict[int, WeightTransferKind] = {
+        0: G_TRANSFER_DONE_KIND,
+        1: G_FULL_UPDATE_KIND,
+        2: G_DELTA_UPDATE_KIND,
+    }
+    transport_by_code: dict[int, DeltaCompressionTransport] = {
+        0: G_DENSE_TRANSPORT,
+        1: G_SPARSE_INDICES_TRANSPORT,
+    }
     try:
-        kind = G_HEADER_CODE_TO_KIND[kind_code]
-        transport = G_HEADER_CODE_TO_TRANSPORT[transport_code]
+        kind = kind_by_code[kind_code]
+        transport = transport_by_code[transport_code]
     except KeyError:
         raise ValueError(
-            f"Unsupported weight transfer header control values: "
+            "Unsupported weight transfer header control values: "
             f"kind={kind_code}, transport={transport_code}"
         ) from None
-    return (
-        cast(WeightTransferKind, kind),
-        cast(DeltaCompressionTransport, transport),
-        payload_numel,
-        metadata_len,
-    )
+    return kind, transport, payload_numel, metadata_len
 
 
 def _encode_header_metadata(header: Mapping[str, Any]) -> bytes:
@@ -404,19 +418,6 @@ def recv_payload(
     return payload
 
 
-def dtype_to_name(dtype: torch.dtype) -> str:
-    return str(dtype).replace("torch.", "")
-
-
-def dtype_from_name(name: str) -> torch.dtype:
-    try:
-        return G_TENSOR_DTYPE_MAP[name]
-    except KeyError:
-        raise ValueError(
-            f"Unsupported tensor dtype in weight transfer: {name}"
-        ) from None
-
-
 def cuda_streams(
     device: torch.device | int | str | None = None,
 ) -> list[torch.cuda.Stream | None]:
@@ -430,10 +431,7 @@ def cuda_streams(
 
 
 @contextlib.contextmanager
-def use_stream(
-    streams: list[torch.cuda.Stream | None],
-    index: int,
-):
+def use_stream(streams: list[torch.cuda.Stream | None], index: int):
     stream = streams[index]
     if stream is None:
         yield
@@ -450,9 +448,8 @@ def record_header_stream(refs: HeaderRefs) -> None:
 
 
 def record_tensor_stream(tensor: torch.Tensor) -> None:
-    if not tensor.is_cuda:
-        return
-    tensor.record_stream(torch.cuda.current_stream())
+    if tensor.is_cuda:
+        tensor.record_stream(torch.cuda.current_stream())
 
 
 def sync_streams(streams: list[torch.cuda.Stream | None]) -> None:
@@ -472,20 +469,20 @@ def synchronize_current_transfer_stream(device: torch.device | int | str) -> Non
 def record_stream_event(stream: torch.cuda.Stream | None) -> torch.cuda.Event | None:
     if stream is None:
         return None
-    return stream.record_event()
+    return cast(torch.cuda.Event, stream.record_event())
 
 
 def record_payload_readiness_events() -> PayloadEvents:
     if not torch.cuda.is_available():
         return ()
-    return (torch.cuda.current_stream().record_event(),)
+    return (cast(torch.cuda.Event, torch.cuda.current_stream().record_event()),)
 
 
-def wait_for_payload_events(events: Iterable[torch.cuda.Event]) -> None:
-    seen_events = set()
-    current_stream = None
+def wait_for_payload_events(events: Iterable[torch.cuda.Event | None]) -> None:
+    seen_events: set[int] = set()
+    current_stream: torch.cuda.Stream | None = None
     for event in events:
-        if id(event) in seen_events:
+        if event is None or id(event) in seen_events:
             continue
         if current_stream is None:
             current_stream = torch.cuda.current_stream()

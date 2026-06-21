@@ -14,11 +14,11 @@
 
 from typing import Any, Literal, NotRequired, TypedDict
 
+from pydantic import BaseModel
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
-DeltaCompressionDType = Literal[
-    "fp16", "float16", "bf16", "bfloat16", "fp32", "float32"
-]
+DeltaCompressionDType = Literal["fp16", "float16", "bf16", "bfloat16", "fp32", "float32"]  # fmt: skip
 
 
 class VllmSpecificArgs(TypedDict):
@@ -41,6 +41,12 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Internal trusted endpoint for sparse delta refit payloads.
+    expose_http_refit_server: NotRequired[bool]
+    # Environment variable containing the internal refit API key.
+    http_refit_api_key_env_var: NotRequired[str]
+    # Fixed internal refit endpoint port for stable Kubernetes targetPorts.
+    http_refit_server_port: NotRequired[int]
     # These kwargs are passed to the vllm.LLM HTTP server Chat Completions endpoint config. Typically this will include things like tool parser, chat template, etc
     http_server_serving_chat_kwargs: NotRequired[dict[str, Any]]
     # Miscellaneous top level vLLM HTTP server arguments.
@@ -54,14 +60,18 @@ class VllmSpecificArgs(TypedDict):
     reasoning_parser_plugin: NotRequired[str]
 
 
-class VllmDeltaCompressionConfig(TypedDict):
-    """Delta-compressed collective refit config for non-colocated vLLM."""
-
+class VllmDeltaCompressionConfig(BaseModel, extra="allow"):
     enabled: bool
     dtype: DeltaCompressionDType
     full_sync_interval: int
     sparse_bucket_size_bytes: int
     delta_load_batch_size_bytes: int
+    index_encoding: Literal["indices", "deltas", "deltas_zstd"] = "indices"
+    prewarm_baseline: bool = True
+    baseline_in_memory: bool = False
+    baseline_mmap_dir: str | None = None
+    direct_sparse_vllm_load: bool = True
+    async_receiver_apply: bool = True
 
 
 class VllmConfig(GenerationConfig):

@@ -78,9 +78,6 @@ from nemo_rl.models.policy.workers.patches import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.weight_transfer import packed_weight_transfer_producer
-from nemo_rl.utils.weight_transfer_delta_tracker import (
-    create_vllm_delta_transfer_tracker,
-)
 
 
 def dtensor_params_generator(
@@ -354,9 +351,6 @@ class DTensorPolicyWorkerV2Impl(
             self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
-        self.delta_weight_transfer_tracker = create_vllm_delta_transfer_tracker(
-            self.cfg.get("generation")
-        )
 
         # Rollout topology constant for SGLang colocated refit: set once via
         # ``set_rollout_num_gpus_per_engine`` after the SGLang generation
@@ -395,9 +389,6 @@ class DTensorPolicyWorkerV2Impl(
         check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        if self.delta_weight_transfer_tracker is not None:
-            self.delta_weight_transfer_tracker.flush_baseline()
-
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -1106,11 +1097,6 @@ class DTensorPolicyWorkerV2Impl(
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
                 state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
 
-        if self.rank == 0 and self.delta_weight_transfer_tracker is not None:
-            self.delta_weight_transfer_tracker.prewarm_baseline_from_metadata(
-                state_dict_info
-            )
-
         return state_dict_info
 
     @torch.no_grad()
@@ -1220,7 +1206,6 @@ class DTensorPolicyWorkerV2Impl(
             iterator=dtensor_params_generator(self.model, self.dtype),
             group=self.model_update_group,
             src=0,
-            delta_tracker=self.delta_weight_transfer_tracker,
         )
 
         # Manually move model to cpu for cpu offload case

@@ -22,8 +22,44 @@ from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
+def _recordable_sparse_delta_names(
+    tracker: Any,
+    update_params: list[tuple[int, str, torch.Tensor]],
+) -> list[str] | None:
+    if tracker is None or not tracker.is_delta_sync():
+        return None
+
+    names = []
+    for _, name, param in update_params:
+        baseline = tracker.baseline.get(name)
+        if (
+            baseline is None
+            or tuple(baseline.shape) != tuple(param.shape)
+            or baseline.dtype != param.dtype
+        ):
+            return None
+        names.append(name)
+    return names
+
+
 class AbstractPolicyWorker:
     """Base class for policy workers with shared functionality."""
+
+    def _setup_model_update_group(
+        self, *, master_address: str, port: int, rank: int, world_size: int
+    ) -> None:
+        """Build the refit process group, init NCCL, and prewarm the baseline."""
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
+
+        self.model_update_group = StatelessProcessGroup(
+            master_address=master_address,
+            port=port,
+            rank=rank,
+            world_size=world_size,
+        )
+        device = torch.cuda.current_device()
+        self.model_update_group.init_nccl_communicator(device=device)
+        self.prewarm_refit_payload_source_baseline_from_metadata()
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
@@ -36,13 +72,119 @@ class AbstractPolicyWorker:
             world_size: Total world size (train_world_size + inference_world_size)
             train_world_size: Number of training workers (used in inference cluster)
         """
-        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
-
-        self.model_update_group = StatelessProcessGroup(
+        self._setup_model_update_group(
             master_address=ip, port=port, rank=self.rank, world_size=world_size
         )
-        device = torch.cuda.current_device()
-        self.model_update_group.init_nccl_communicator(device=device)
+
+    def is_refit_payload_source(self, *, fallback_to_rank: bool = False) -> bool:
+        """Return whether this worker sources payloads for its refit group."""
+        model_update_group = getattr(self, "model_update_group", None)
+        if model_update_group is not None:
+            return getattr(model_update_group, "rank", None) == 0
+        return fallback_to_rank and getattr(self, "rank", None) == 0
+
+    def prewarm_refit_payload_source_baseline_from_metadata(self) -> None:
+        """Allocate delta-baseline storage on selected refit payload sources."""
+        if not self.is_refit_payload_source():
+            return
+        tracker = getattr(self, "delta_weight_transfer_tracker", None)
+        metadata = getattr(self, "_refit_param_info_for_delta_baseline", None)
+        if tracker is None or metadata is None:
+            return
+        tracker.prewarm_baseline_from_metadata(metadata)
+
+    def has_pending_full_sync_baseline(self) -> bool:
+        """Return whether this worker still needs live full-sync baseline prewarm."""
+        tracker = getattr(self, "delta_weight_transfer_tracker", None)
+        if tracker is None:
+            return False
+        return tracker.has_pending_full_sync_baseline()
+
+    @torch.no_grad()
+    def apply_refit_benchmark_sparse_update(
+        self,
+        *,
+        fraction: float,
+        delta: float,
+        seed: int,
+        pattern: str = "contiguous",
+    ) -> dict[str, float | int | str]:
+        """Apply deterministic sparse updates for refit verifier benchmarks."""
+        if fraction <= 0:
+            return {
+                "tensors": 0,
+                "values": 0,
+                "total_values": 0,
+                "stride": 0,
+                "pattern": "contiguous",
+            }
+        if fraction > 1:
+            raise ValueError("fraction must be <= 1")
+        if pattern not in {"contiguous", "strided"}:
+            raise ValueError(f"Unsupported sparse update pattern: {pattern!r}")
+
+        update_params = [
+            (idx, name, param)
+            for idx, (name, param) in enumerate(self.model.named_parameters())
+            if param.requires_grad and param.dtype.is_floating_point
+        ]
+        tracker = getattr(self, "delta_weight_transfer_tracker", None)
+        recorded_names = _recordable_sparse_delta_names(tracker, update_params)
+
+        total_values = mutated_values = mutated_tensors = last_stride = 0
+        rank_offset = int(self.rank) * 104729
+        for update_idx, (param_idx, _param_name, param) in enumerate(update_params):
+            flat = param.detach().view(-1)
+            numel = int(flat.numel())
+            total_values += numel
+            update_values = min(numel, max(1, round(numel * fraction)))
+            if pattern == "contiguous":
+                start = (seed + rank_offset + param_idx * 1009) % (
+                    numel - update_values + 1
+                )
+                flat.narrow(0, start, update_values).add_(delta)
+                if recorded_names is not None and tracker is not None:
+                    tracker.record_sparse_delta_range(
+                        recorded_names[update_idx],
+                        start=start,
+                        values=torch.full(
+                            (update_values,),
+                            float(delta),
+                            dtype=tracker.delta_dtype,
+                            device="cpu",
+                        ),
+                    )
+            else:
+                last_stride = max(1, numel // update_values)
+                start = (seed + rank_offset + param_idx * 1009) % last_stride
+                locations = (
+                    torch.arange(update_values, dtype=torch.long, device=flat.device)
+                    .mul_(last_stride)
+                    .add_(start)
+                )
+                deltas = torch.full(
+                    (update_values,), float(delta), dtype=flat.dtype, device=flat.device
+                )
+                flat.index_add_(0, locations, deltas)
+                if recorded_names is not None and tracker is not None:
+                    tracker.record_sparse_delta_locations(
+                        recorded_names[update_idx],
+                        locations=locations,
+                        values=deltas,
+                    )
+            mutated_tensors += 1
+            mutated_values += update_values
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return {
+            "tensors": mutated_tensors,
+            "values": mutated_values,
+            "total_values": total_values,
+            "actual_fraction": mutated_values / total_values if total_values else 0.0,
+            "stride": last_stride,
+            "pattern": pattern,
+        }
 
     def is_alive(self) -> bool:
         """Check if the worker is alive."""

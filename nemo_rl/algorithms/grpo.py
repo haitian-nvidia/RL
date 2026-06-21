@@ -80,6 +80,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.models.generation.constants import VLLM_HTTP_BACKEND
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
@@ -100,8 +101,12 @@ from nemo_rl.utils.logger import (
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.refit_orchestration import (
+    queue_baseline_prewarm_after_source_broadcast,
+)
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 # ===============================================================================
 # Configuration
@@ -441,7 +446,11 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
+    backend = generation_config["backend"]
+    external_generation = backend == VLLM_HTTP_BACKEND
     colocated_inference = generation_config["colocated"]["enabled"]
+    if external_generation and colocated_inference:
+        raise ValueError("vllm_http generation must be configured as non-colocated.")
 
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
@@ -553,6 +562,28 @@ def setup(
             flush=True,
         )
 
+    elif external_generation:
+        train_nodes = policy_nodes
+        train_gpus_per_node = cluster_config["gpus_per_node"]
+        train_cluster = RayVirtualCluster(
+            name="grpo_train_cluster",
+            bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
+            use_gpus=True,
+            num_gpus_per_node=train_gpus_per_node,
+            max_colocated_worker_groups=1,
+            port_range_low=cluster_config.get("master_port_range_low"),
+            port_range_high=cluster_config.get("master_port_range_high"),
+        )
+        inference_cluster = train_cluster
+        inference_nodes = 0
+        inference_gpus_per_node = 0
+        print(
+            "  ✓ Ray train cluster initialized with "
+            f"{train_nodes} nodes with {train_gpus_per_node} GPUs per node; "
+            "generation is external over HTTP",
+            flush=True,
+        )
+
     else:
         # train resources will be updated through overall and inference resources below
         train_gpus_per_node = cluster_config["gpus_per_node"]
@@ -646,7 +677,6 @@ def setup(
     print("\n▶ Setting up model and training...", flush=True)
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
-    backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
     # Dictionary to store worker initialization timing stats for logging
@@ -966,14 +996,66 @@ def setup(
             flush=True,
         )
 
+    elif external_generation:
+        t0 = time.perf_counter()
+        from nemo_rl.models.generation.vllm_http import VllmHttpGeneration
+
+        policy_generation = VllmHttpGeneration(
+            cluster=inference_cluster, config=generation_config
+        )
+        worker_init_timing_metrics["vllm_http_init_time_s"] = time.perf_counter() - t0
+        policy, policy_time = init_policy()
+        worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        worker_init_timing_metrics["parallel_init_enabled"] = 0.0
+        print(
+            f"  ✓ Using external vLLM HTTP backend for generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
+    else:
+        raise ValueError(f"Unsupported generation backend: {backend}")
+
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
+    weight_sync: WeightSynchronizer | None = None
+    if policy_generation is not None and not isinstance(
+        policy_generation, MegatronGeneration
+    ):
+        weight_sync = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+            refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+            refit_transport="vllm_http_sparse" if external_generation else None,
+            # refit_urls is only consumed by the vllm_http_sparse transport
+            # (external generation); avoid the worker round-trip otherwise.
+            refit_urls=(
+                policy_generation.report_refit_server_base_urls()
+                if external_generation
+                else None
+            ),
+            refit_api_key_env_var=getattr(
+                policy_generation, "refit_api_key_env_var", None
+            ),
+            refit_request_timeout_s=float(
+                getattr(policy_generation, "refit_request_timeout_s", 600.0)
+            ),
+        )
+        setattr(policy_generation, "_nrl_weight_synchronizer", weight_sync)
+
+    if weight_sync is not None and not external_generation:
+        t0 = time.perf_counter()
+        weight_sync.init_communicator()
+        worker_init_timing_metrics["weight_sync_init_time_s"] = time.perf_counter() - t0
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    elif not colocated_inference and not external_generation:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -1012,9 +1094,10 @@ def setup(
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
-    state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+    if weight_sync is None or external_generation:
+        state_dict_info = policy.prepare_refit_info()
+        if policy_generation is not None:
+            policy_generation.prepare_refit_info(state_dict_info)
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -1566,6 +1649,70 @@ def _clip_grpo_advantages(
     return advantages
 
 
+def _start_initial_policy_generation_weight_sync(
+    policy: ColocatablePolicyInterface,
+    policy_generation: GenerationInterface,
+    *,
+    need_refit: bool,
+    policy_generation_stale: bool,
+    current_step: int,
+    total_steps: int,
+    requires_kv_scales: bool,
+) -> bool:
+    """Start step-0 external refit setup while initial generation can run."""
+    if (
+        not need_refit
+        or not policy_generation_stale
+        or requires_kv_scales
+        or current_step != 0
+        or total_steps != 0
+    ):
+        return False
+
+    weight_sync = _external_policy_generation_weight_synchronizer(
+        policy, policy_generation
+    )
+    if weight_sync is None:
+        return False
+
+    if not getattr(weight_sync, "is_initialized", False):
+        weight_sync.init_communicator()
+    return True
+
+
+def _policy_generation_uses_external_sparse_http(
+    policy_generation: GenerationInterface,
+) -> bool:
+    cfg = getattr(policy_generation, "cfg", None)
+    return isinstance(cfg, dict) and cfg.get("backend") == VLLM_HTTP_BACKEND
+
+
+def _external_policy_generation_weight_synchronizer(
+    policy: ColocatablePolicyInterface,
+    policy_generation: GenerationInterface,
+) -> WeightSynchronizer | None:
+    if not _policy_generation_uses_external_sparse_http(policy_generation):
+        return None
+    weight_sync = getattr(policy_generation, "_nrl_weight_synchronizer", None)
+    if weight_sync is None:
+        weight_sync = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=VLLM_HTTP_BACKEND,
+            colocated=False,
+            refit_transport="vllm_http_sparse",
+            refit_urls=policy_generation.report_refit_server_base_urls(),
+            refit_api_key_env_var=getattr(
+                policy_generation, "refit_api_key_env_var", None
+            ),
+            refit_request_timeout_s=float(
+                getattr(policy_generation, "refit_request_timeout_s", 600.0)
+            ),
+        )
+        setattr(policy_generation, "_nrl_weight_synchronizer", weight_sync)
+    return weight_sync
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1585,6 +1732,26 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
+    weight_sync = getattr(policy_generation, "_nrl_weight_synchronizer", None)
+    if weight_sync is None:
+        weight_sync = _external_policy_generation_weight_synchronizer(
+            policy, policy_generation
+        )
+    if weight_sync is not None and not isinstance(
+        policy_generation, MegatronGeneration
+    ):
+        if _policy_generation_uses_external_sparse_http(policy_generation):
+            policy.offload_before_refit()
+            try:
+                weight_sync.sync_weights(timer=timer, kv_scales=kv_scales)
+            finally:
+                policy.prepare_for_training()
+        else:
+            if not colocated_inference:
+                policy.offload_before_refit()
+            weight_sync.sync_weights(timer=timer, kv_scales=kv_scales)
+        return
+
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.suspend_for_refit()
@@ -1662,10 +1829,22 @@ def refit_policy_generation(
                 )
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
-            ray.get(futures_train)
+            # Build the delta baseline after the policy broadcast completes,
+            # while generation workers may still be draining collective work.
+            queue_baseline_prewarm_after_source_broadcast(
+                policy,
+                futures_train,
+                kv_scales=kv_scales,
+            )
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
-            policy.prepare_for_training()
+            # For vLLM NCCL, policy.prewarm_delta_baseline() above returns Ray
+            # refs that can keep building the CPU baseline while generation runs.
+            # The next policy-side model use waits through
+            # Policy.prepare_for_lp_inference()/prepare_for_training(), so do not
+            # pull that wait back into the refit timer here.
+            if isinstance(policy_generation, MegatronGeneration):
+                policy.prepare_for_training()
 
         # check if update is successful
         if not update_success:
@@ -1683,6 +1862,7 @@ def refit_policy_generation(
     # Megatron non-colocated inference needs to enter inference mode after refit.
     if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["kv_cache"])
+        policy.prewarm_delta_baseline(kv_scales=kv_scales)
 
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.resume_after_refit()
@@ -1903,6 +2083,17 @@ def grpo_train(
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+
+    if _start_initial_policy_generation_weight_sync(
+        policy,
+        policy_generation,
+        need_refit=NEED_REFIT,
+        policy_generation_stale=POLICY_GENERATION_STALE,
+        current_step=current_step,
+        total_steps=total_steps,
+        requires_kv_scales=sync_kv_scales,
+    ):
+        POLICY_GENERATION_STALE = False
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -3098,9 +3289,11 @@ def async_grpo_train(
     )
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
+    sync_kv_scales = policy_generation.requires_kv_scale_sync
 
     # Training state
     step = grpo_save_state["current_step"]
+    total_steps = grpo_save_state.get("total_steps", step)
     weight_version = step  # Tracks refitted weight versions
     consumed_samples = grpo_save_state["consumed_samples"]
     total_valid_tokens = grpo_save_state.get(
@@ -3117,6 +3310,17 @@ def async_grpo_train(
     assert not colocated_inference, (
         "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
     )
+
+    if _start_initial_policy_generation_weight_sync(
+        policy,
+        policy_generation,
+        need_refit=NEED_REFIT,
+        policy_generation_stale=POLICY_GENERATION_STALE,
+        current_step=step,
+        total_steps=total_steps,
+        requires_kv_scales=sync_kv_scales,
+    ):
+        POLICY_GENERATION_STALE = False
 
     # Calculate minimum buffer size from training requirements
     # In per-prompt buffer mode, one buffer entry is 1 prompt * num_generations_per_prompt

@@ -53,6 +53,7 @@ from nemo_rl.algorithms.grpo import (
     _log_mixed_rewards_and_advantages_information,
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
+    _start_initial_policy_generation_weight_sync,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
     scale_rewards,
@@ -472,6 +473,17 @@ def grpo_train_sync(
             "because TQ-resident tensors are CPU-side.",
             stacklevel=2,
         )
+
+    if _start_initial_policy_generation_weight_sync(
+        policy,
+        policy_generation,
+        need_refit=NEED_REFIT,
+        policy_generation_stale=POLICY_GENERATION_STALE,
+        current_step=current_step,
+        total_steps=total_steps,
+        requires_kv_scales=sync_kv_scales,
+    ):
+        POLICY_GENERATION_STALE = False
 
     # ── Sync rollout actor (rollout 1-hop put) ──────────────────────
     # The actor owns the multi-turn rollout loop AND post-rollout

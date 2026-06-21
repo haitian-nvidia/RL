@@ -164,6 +164,11 @@ class PolicyInterface(ABC):
 
 
 class ColocatablePolicyInterface(PolicyInterface):
+    @property
+    def requires_kv_scale_sync(self) -> bool:
+        """Whether the policy-as-generation fallback needs KV scale sync."""
+        return False
+
     @abstractmethod
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
@@ -181,6 +186,26 @@ class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass
+
+    def prewarm_delta_baseline(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        _participate: bool = False,
+    ) -> list[ray.ObjectRef]:
+        """Queue deferred delta baseline construction when supported."""
+        del kv_scales, _participate
+        return []
+
+    def init_remote_sparse_delta_baseline(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Initialize source-side sparse-delta baselines for remote HTTP refit."""
+        del kv_scales
+        raise NotImplementedError(
+            "init_remote_sparse_delta_baseline is not implemented for this policy"
+        )
 
     @abstractmethod
     def stream_weights_via_ipc_zmq(
@@ -211,6 +236,20 @@ class ColocatablePolicyInterface(PolicyInterface):
         """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
         raise NotImplementedError(
             "set_rollout_num_gpus_per_engine is not implemented for this policy worker"
+        )
+
+    def stream_sparse_weights_via_http(
+        self,
+        refit_urls: list[str],
+        *,
+        api_key_env_var: Optional[str] = None,
+        timeout_s: float = 600.0,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Stream sparse vLLM delta payloads to remote HTTP refit endpoints."""
+        del refit_urls, api_key_env_var, timeout_s, kv_scales
+        raise NotImplementedError(
+            "stream_sparse_weights_via_http is not implemented for this policy"
         )
 
     @abstractmethod

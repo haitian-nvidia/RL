@@ -849,6 +849,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         app = FastAPI()
 
         app = self._setup_vllm_openai_api_server(app)
+        if self.cfg["vllm_cfg"].get("expose_http_refit_server", False):
+            app = self._setup_vllm_refit_api_server(app)
 
         ########################################
         # Server spinup
@@ -873,7 +875,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             free_port = _get_free_port_local(port_range_low, port_range_high)
             reserved_sock = None
 
-        base_url = f"http://{node_ip}:{free_port}/v1"
+        refit_base_url = f"http://{node_ip}:{free_port}"
+        base_url = f"{refit_base_url}/v1"
+        self.refit_server_base_url = refit_base_url
         print(f"Starting server on {base_url}")
 
         config = uvicorn.Config(
@@ -913,6 +917,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         return thread, base_url, server
 
+    async def _apply_sparse_payload(self, body: bytes) -> dict[str, Any]:
+        return await self.update_weights_from_serialized_sparse_payload_async(body)
+
     async def init_collective_async(
         self,
         rank_prefix: int,
@@ -920,6 +927,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         port: int,
         world_size: int,
         train_world_size: int,
+        local_world_size: int,
     ) -> None:
         await self.llm.collective_rpc(
             "init_collective",
@@ -929,6 +937,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 port,
                 world_size,
                 train_world_size,
+                local_world_size,
             ),
         )
 
@@ -1340,7 +1349,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc(
             "prepare_refit_info",
-            args=(state_dict_info, self._get_delta_load_batch_size_bytes()),
+            args=(
+                state_dict_info,
+                self._get_delta_load_batch_size_bytes(),
+                self._use_direct_sparse_delta_load(),
+            ),
         )
 
     async def update_weights_via_ipc_zmq_async(
@@ -1381,6 +1394,37 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
             traceback.print_exc()
             return False
+
+    async def update_weights_from_serialized_sparse_payload_async(
+        self,
+        serialized_payload: bytes,
+    ) -> dict[str, Any]:
+        """Apply one HTTP sparse-delta payload through vLLM collective_rpc."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM "
+                "or non-model-owner"
+            )
+
+            if not self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError("HTTP sparse refit requires async_engine=True.")
+
+            result_or_coro = await self.llm.collective_rpc(
+                "update_weights_from_serialized_sparse_payload",
+                args=(serialized_payload,),
+            )
+
+            if asyncio.iscoroutine(result_or_coro):
+                worker_results = await result_or_coro
+            else:
+                worker_results = result_or_coro
+            return self._refit_collective_response(worker_results)
+        except Exception as e:
+            print(f"Exception during HTTP sparse refit weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return {"ok": False, "error": str(e)}
 
     async def update_weights_from_collective_async(self) -> bool:
         """Async version of update_weights_from_collective."""

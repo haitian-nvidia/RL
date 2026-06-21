@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import importlib.util
 import json
 import os
 import sys
 import types
+from collections import deque
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -37,6 +39,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    BaseVllmGenerationWorker,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -157,6 +160,212 @@ def test_resolve_enable_prefix_caching_uses_cuda_capability_for_auto(monkeypatch
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
 
     assert _resolve_enable_prefix_caching({}) is False
+
+
+def _load_vllm_backend_module(monkeypatch):
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    return importlib.import_module("nemo_rl.models.generation.vllm.vllm_backend")
+
+
+def _sparse_delta_extension(backend_module, modules):
+    extension = backend_module.VllmInternalWorkerExtension.__new__(
+        backend_module.VllmInternalWorkerExtension
+    )
+    extension.rank = 0
+    extension._direct_sparse_delta_modules = modules
+    extension._direct_sparse_delta_targets = None
+    extension._direct_sparse_delta_plan_cache = None
+    extension.model_runner = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            hf_to_vllm_mapper=None,
+            named_modules=lambda: modules.items(),
+        )
+    )
+    return extension
+
+
+def _sparse_item(name: str, shape: tuple[int, ...]) -> dict[str, object]:
+    return {
+        "name": name,
+        "shape": shape,
+        "dtype": "float32",
+        "numel": int(torch.empty(shape).numel()),
+    }
+
+
+def test_direct_sparse_delta_qkv_plan_remaps_replicated_kv_shard(
+    monkeypatch,
+) -> None:
+    backend = _load_vllm_backend_module(monkeypatch)
+    target = torch.zeros(16, 3, dtype=torch.float32)
+    target.output_dim = 0
+    module = types.SimpleNamespace(
+        num_heads=4,
+        num_kv_heads=2,
+        head_size=2,
+        v_head_size=2,
+        tp_rank=3,
+        num_kv_head_replicas=2,
+    )
+    extension = _sparse_delta_extension(
+        backend,
+        {"layers.0.self_attn.qkv_proj": module},
+    )
+    item = _sparse_item("layers.0.self_attn.k_proj.weight", (8, 3))
+
+    plan = extension._direct_sparse_delta_qkv_plan(
+        item,
+        str(item["name"]),
+        {"layers.0.self_attn.qkv_proj.weight": target},
+    )
+    locations, values = extension._local_sparse_delta_update_inputs(
+        torch.tensor([2 * 3 + 1, 4 * 3 + 1, 7 * 3 + 2], dtype=torch.int64),
+        torch.tensor([9.0, 10.0, 11.0], dtype=torch.float32),
+        plan,
+    )
+
+    assert torch.equal(locations, torch.tensor([8 * 3 + 1, 11 * 3 + 2]))
+    torch.testing.assert_close(values, torch.tensor([10.0, 11.0]))
+    target.view(-1).index_add_(0, locations, values)
+    torch.testing.assert_close(target[8, 1], torch.tensor(10.0))
+    torch.testing.assert_close(target[11, 2], torch.tensor(11.0))
+    torch.testing.assert_close(target.sum(), torch.tensor(21.0))
+
+
+def test_direct_sparse_delta_expert_plan_remaps_local_w13_up_shard(
+    monkeypatch,
+) -> None:
+    backend = _load_vllm_backend_module(monkeypatch)
+    target = torch.zeros(2, 6, 3, dtype=torch.float32)
+    module = types.SimpleNamespace(
+        tp_rank=1,
+        moe_config=types.SimpleNamespace(is_act_and_mul=True),
+        _map_global_expert_id_to_local_expert_id=lambda expert_id: 1
+        if expert_id == 5
+        else -1,
+    )
+    extension = _sparse_delta_extension(
+        backend,
+        {"model.layers.0.mlp.experts": module},
+    )
+    item = _sparse_item("model.layers.0.mlp.experts.5.up_proj.weight", (6, 3))
+
+    plan = extension._direct_sparse_delta_expert_plan(
+        item,
+        str(item["name"]),
+        {"model.layers.0.mlp.experts.w13_weight": target},
+    )
+    locations, values = extension._local_sparse_delta_update_inputs(
+        torch.tensor([1 * 3, 3 * 3 + 1, 5 * 3 + 2], dtype=torch.int64),
+        torch.tensor([3.0, 4.0, 5.0], dtype=torch.float32),
+        plan,
+    )
+
+    assert torch.equal(locations, torch.tensor([28, 35]))
+    torch.testing.assert_close(values, torch.tensor([4.0, 5.0]))
+    target.view(-1).index_add_(0, locations, values)
+    torch.testing.assert_close(target[1, 3, 1], torch.tensor(4.0))
+    torch.testing.assert_close(target[1, 5, 2], torch.tensor(5.0))
+    torch.testing.assert_close(target.sum(), torch.tensor(9.0))
+
+
+def test_direct_sparse_delta_shard_plan_remaps_tp_rank_slice(monkeypatch) -> None:
+    backend = _load_vllm_backend_module(monkeypatch)
+    target = torch.zeros(3, 4, dtype=torch.float32)
+    target.output_dim = 0
+    target.tp_size = 2
+    target.tp_rank = 1
+    extension = _sparse_delta_extension(backend, {})
+    item = _sparse_item("linear.weight", (6, 4))
+
+    plan = extension._direct_sparse_delta_shard_plan(item, target)
+    locations, values = extension._local_sparse_delta_update_inputs(
+        torch.tensor([1, 3 * 4 + 2, 5 * 4 + 3], dtype=torch.int64),
+        torch.tensor([5.0, 6.0, 7.0], dtype=torch.float32),
+        plan,
+    )
+
+    assert torch.equal(locations, torch.tensor([2, 11]))
+    torch.testing.assert_close(values, torch.tensor([6.0, 7.0]))
+    target.view(-1).index_add_(0, locations, values)
+    torch.testing.assert_close(target[0, 2], torch.tensor(6.0))
+    torch.testing.assert_close(target[2, 3], torch.tensor(7.0))
+    torch.testing.assert_close(target.sum(), torch.tensor(13.0))
+
+
+class _SparseApplyQueueWorker(BaseVllmGenerationWorker):
+    def __init__(
+        self,
+        results,
+        *,
+        depth: int = 1,
+        sync_result: dict[str, object] | None = None,
+    ) -> None:
+        self._results = deque(results)
+        self._depth = depth
+        self._sync_result = sync_result or {"ok": True, "receiver_sync_s": 0.25}
+        self.applied = []
+        self.sync_count = 0
+        self.llm = None
+
+    def _refit_apply_queue_depth(self) -> int:
+        return self._depth
+
+    def _apply_sparse_payload_for_queue(self, body: bytes) -> dict[str, object]:
+        self.applied.append(body)
+        result = self._results.popleft()
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def _synchronize_refit_apply_workers(self) -> dict[str, object]:
+        self.sync_count += 1
+        return self._sync_result
+
+
+def test_vllm_sparse_apply_queue_drains_fifo_with_backpressure() -> None:
+    worker = _SparseApplyQueueWorker(
+        [
+            {"ok": True, "receiver_total_s": 0.1},
+            {"ok": True, "receiver_total_s": 0.2},
+        ],
+        depth=1,
+    )
+
+    try:
+        first = worker._enqueue_sparse_payload_apply(b"first")
+        second = worker._enqueue_sparse_payload_apply(b"second")
+        flushed = worker._flush_queued_sparse_payloads()
+    finally:
+        worker._shutdown_refit_apply_queue()
+
+    assert first == {"ok": True, "queued": True, "queue_depth": 1}
+    assert second["ok"]
+    assert second["payloads"] == 1
+    assert second["queue_depth"] == 1
+    assert second["receiver_total_s"] == 0.1
+    assert flushed["ok"]
+    assert flushed["payloads"] == 1
+    assert flushed["receiver_total_s"] == 0.2
+    assert flushed["receiver_sync_s"] == 0.25
+    assert worker.sync_count == 1
+    assert worker.applied == [b"first", b"second"]
+
+
+def test_vllm_sparse_apply_queue_reports_deferred_errors() -> None:
+    worker = _SparseApplyQueueWorker([RuntimeError("boom")])
+
+    try:
+        queued = worker._enqueue_sparse_payload_apply(b"payload")
+        flushed = worker._flush_queued_sparse_payloads()
+    finally:
+        worker._shutdown_refit_apply_queue()
+
+    assert queued == {"ok": True, "queued": True, "queue_depth": 1}
+    assert not flushed["ok"]
+    assert flushed["payloads"] == 1
+    assert flushed["errors"][0]["error"] == "boom"
+    assert worker.sync_count == 0
 
 
 basic_lora_test_config: LoRAConfig = {

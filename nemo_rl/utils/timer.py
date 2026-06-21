@@ -106,6 +106,10 @@ class Timer:
         del self._start_times[label]
         return elapsed
 
+    def is_running(self, label: str) -> bool:
+        """Return whether timing is currently active for the given label."""
+        return label in self._start_times
+
     @contextmanager
     def time(self, label: str) -> Generator[None, None, None]:
         """Context manager for timing a block of code.

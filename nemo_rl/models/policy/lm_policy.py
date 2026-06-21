@@ -208,6 +208,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 f"Please adjust your cluster size or parallelism parameters."
             )
 
+        self._delta_baseline_prewarm_submitted = False
+        self._delta_baseline_prewarm_refs: list[ray.ObjectRef] = []
+        self._refit_payload_source_ranks: tuple[int, ...] | None = None
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
                 pp_size,  # PP
@@ -363,6 +366,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
+        self._refit_payload_source_ranks = (0,)
         futures = self.worker_group.run_all_workers_single_data(
             "init_collective",
             ip=ip,
@@ -882,10 +886,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
         # onload everything to the GPU
+        self._wait_for_delta_baseline_prewarm()
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
     def prepare_for_lp_inference(self, *args: Any, **kwargs: Any) -> None:
+        self._wait_for_delta_baseline_prewarm()
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_for_lp_inference"
         )
@@ -905,6 +911,55 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = ray.get(futures)
         # Only get the first worker's info since all workers will have the same result
         return results[0]
+
+    def prewarm_delta_baseline(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Queue deferred delta baseline construction on policy workers."""
+        if self._delta_baseline_prewarm_submitted:
+            return []
+        if self._refit_payload_source_ranks:
+            pending_refs = [
+                self.worker_group.run_single_worker_single_data(
+                    "has_pending_full_sync_baseline",
+                    worker_idx=source_rank,
+                )
+                for source_rank in self._refit_payload_source_ranks
+            ]
+            if not any(ray.get(pending_refs)):
+                self._delta_baseline_prewarm_refs = []
+                self._delta_baseline_prewarm_submitted = True
+                return []
+        refs = self.worker_group.run_all_workers_single_data(
+            "prewarm_delta_baseline",
+            kv_scales=kv_scales,
+            _participate=True,
+        )
+        self._delta_baseline_prewarm_refs = refs
+        self._delta_baseline_prewarm_submitted = True
+        return refs
+
+    def init_remote_sparse_delta_baseline(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Initialize source-side sparse-delta baselines for remote HTTP refit."""
+        return self.worker_group.run_all_workers_single_data(
+            "init_remote_sparse_delta_baseline",
+            kv_scales=kv_scales,
+        )
+
+    def _wait_for_delta_baseline_prewarm(self) -> None:
+        refs = self._delta_baseline_prewarm_refs
+        if not refs:
+            self._delta_baseline_prewarm_submitted = False
+            return
+        try:
+            ray.get(refs)
+        finally:
+            self._delta_baseline_prewarm_refs = []
+            self._delta_baseline_prewarm_submitted = False
 
     def finish_inference(self) -> None:
         """Offload policy model to CPU after inference."""
@@ -989,6 +1044,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self, buffer_size_bytes: int, kv_scales: Optional[dict[str, float]] = None
     ) -> list[ray.ObjectRef]:
         """Send the weights for IPC handles via ZMQ socket."""
+        self._wait_for_delta_baseline_prewarm()
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_ipc_zmq",
             buffer_size_bytes=buffer_size_bytes,
@@ -1013,6 +1069,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         The rollout TP size is captured once via
         ``set_rollout_num_gpus_per_engine`` and reused by each worker.
         """
+        self._wait_for_delta_baseline_prewarm()
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_http",
             rollout_engine_urls=rollout_engine_urls,
@@ -1029,10 +1086,29 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         )
 
+    def stream_sparse_weights_via_http(
+        self,
+        refit_urls: list[str],
+        *,
+        api_key_env_var: Optional[str] = None,
+        timeout_s: float = 600.0,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Send sparse vLLM delta payloads to remote HTTP refit endpoints."""
+        self._wait_for_delta_baseline_prewarm()
+        return self.worker_group.run_all_workers_single_data(
+            "stream_sparse_weights_via_http",
+            refit_urls=refit_urls,
+            api_key_env_var=api_key_env_var,
+            timeout_s=timeout_s,
+            kv_scales=kv_scales,
+        )
+
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
+        self._wait_for_delta_baseline_prewarm()
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",
             kv_scales=kv_scales,

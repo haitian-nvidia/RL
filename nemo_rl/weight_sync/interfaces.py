@@ -78,15 +78,15 @@ class WeightSynchronizer(ABC):
 
         Step 4 (verification) is performed explicitly by IPC and NCCL
         transports, which check ``update_success`` and raise on failure. The
-        HTTP transport relies on ``ray.get()`` to propagate any server-side
-        errors (matching the existing grpo.py behavior).
+        HTTP transports rely on worker results returned through ``ray.get()``
+        and raise when any endpoint reports failure.
 
         Args:
             timer: Optional Timer for profiling individual phases.
             kv_scales: Optional KV cache scales for FP8 quantization.
-                **Note**: Only honored by the NCCL collective transport,
-                which forwards them to ``policy.broadcast_weights_for_collective()``.
-                IPC and HTTP transports ignore this parameter.
+                Honored by transports that can export KV scales from policy
+                workers, including NCCL collective and vLLM sparse HTTP refit.
+                IPC and colocated HTTP transports ignore this parameter.
 
         Raises:
             RuntimeError: If the weight transfer fails.

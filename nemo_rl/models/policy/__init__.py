@@ -273,6 +273,9 @@ class MegatronConfig(TypedDict):
     bias_activation_fusion: bool
     # Force reconvert from HF even if the checkpoint already exists (default: False)
     force_reconvert_from_hf: NotRequired[bool]
+    # Skip Megatron DDP wrapping for read-only Megatron workers (for example,
+    # refit-only benchmarks initialized with init_optimizer=False).
+    wrap_with_ddp: NotRequired[bool]
     # Attention backend available values:
     # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/enums.py#L60
     attention_backend: NotRequired[str]

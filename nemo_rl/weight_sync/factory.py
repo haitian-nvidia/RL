@@ -16,7 +16,8 @@
 
 Selects the appropriate weight synchronizer based on the deployment
 topology (colocated vs. non-colocated) and the generation backend
-(vLLM uses IPC/ZMQ, SGLang uses HTTP, non-colocated uses NCCL).
+(colocated vLLM uses IPC/ZMQ, SGLang uses HTTP, and non-colocated vLLM uses
+NCCL collectives or sparse HTTP refit).
 """
 
 from typing import Any, Optional
@@ -25,6 +26,7 @@ from nemo_rl.models.generation.constants import (
     MEGATRON_BACKEND,
     SGLANG_BACKEND,
     VLLM_BACKEND,
+    VLLM_HTTP_BACKEND,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -37,17 +39,28 @@ def create_weight_synchronizer(
     train_cluster: Optional[Any] = None,
     inference_cluster: Optional[Any] = None,
     refit_buffer_size_gb: Optional[int] = None,
+    refit_transport: Optional[str] = None,
+    refit_urls: Optional[list[str]] = None,
+    refit_api_key_env_var: Optional[str] = None,
+    refit_request_timeout_s: float = 600.0,
 ) -> WeightSynchronizer:
     """Create the appropriate WeightSynchronizer for the given deployment.
 
     Args:
         policy: Policy object (ColocatablePolicyInterface).
         generation: Generation object (GenerationInterface).
-        generation_backend: Name of the generation backend ("vllm", "sglang", "megatron").
+        generation_backend: Name of the generation backend ("vllm",
+            "vllm_http", "sglang", "megatron").
         colocated: Whether policy and generation share the same GPUs.
         train_cluster: RayVirtualCluster for training workers (required for non-colocated).
         inference_cluster: RayVirtualCluster for inference workers (required for non-colocated).
         refit_buffer_size_gb: Optional fixed buffer size for IPC weight staging.
+        refit_transport: Optional explicit refit transport. Use
+            "vllm_http_sparse" for cross-region vLLM sparse HTTP refit.
+        refit_urls: Optional vLLM refit server base URLs for HTTP sparse refit.
+        refit_api_key_env_var: Optional environment variable containing the HTTP
+            refit endpoint API key.
+        refit_request_timeout_s: Per-request timeout for HTTP sparse refit.
 
     Returns:
         A WeightSynchronizer instance appropriate for the deployment topology.
@@ -56,7 +69,12 @@ def create_weight_synchronizer(
         NotImplementedError: If the requested configuration is not supported.
         ValueError: If required arguments are missing.
     """
-    _SUPPORTED_BACKENDS = {VLLM_BACKEND, SGLANG_BACKEND, MEGATRON_BACKEND}
+    _SUPPORTED_BACKENDS = {
+        VLLM_BACKEND,
+        VLLM_HTTP_BACKEND,
+        SGLANG_BACKEND,
+        MEGATRON_BACKEND,
+    }
     if generation_backend not in _SUPPORTED_BACKENDS:
         raise ValueError(
             f"Unknown generation backend {generation_backend!r}. "
@@ -70,6 +88,27 @@ def create_weight_synchronizer(
         if generation_backend == SGLANG_BACKEND:
             raise NotImplementedError(
                 "SGLang does not support non-colocated inference mode."
+            )
+        if refit_transport == "vllm_http_sparse":
+            if generation_backend not in (VLLM_BACKEND, VLLM_HTTP_BACKEND):
+                raise ValueError(
+                    "refit_transport='vllm_http_sparse' is only valid for "
+                    "vLLM or vllm_http."
+                )
+            from nemo_rl.weight_sync.vllm_http_sparse_weight_synchronizer import (
+                VllmHTTPSparseWeightSynchronizer,
+            )
+
+            return VllmHTTPSparseWeightSynchronizer(
+                policy=policy,
+                generation=generation,
+                refit_urls=refit_urls,
+                api_key_env_var=refit_api_key_env_var,
+                request_timeout_s=refit_request_timeout_s,
+            )
+        if refit_transport not in (None, "collective"):
+            raise ValueError(
+                f"Unsupported non-colocated refit transport {refit_transport!r}."
             )
         if train_cluster is None or inference_cluster is None:
             raise ValueError(

@@ -34,6 +34,9 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.ipc_weight_synchronizer import (
     IPCWeightSynchronizer,
 )
+from nemo_rl.weight_sync.vllm_http_sparse_weight_synchronizer import (
+    VllmHTTPSparseWeightSynchronizer,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,6 +50,7 @@ def _mock_policy(**overrides):
     policy.prepare_refit_info.return_value = {"layer_0": {"shape": [4096, 4096]}}
     policy.stream_weights_via_ipc_zmq.return_value = [MagicMock()]
     policy.stream_weights_via_http.return_value = [MagicMock()]
+    policy.init_remote_sparse_delta_baseline.return_value = [MagicMock()]
     policy.broadcast_weights_for_collective.return_value = [MagicMock()]
     policy.init_collective.return_value = [MagicMock()]
     policy.get_free_memory_bytes.return_value = 1024**3  # 1 GB
@@ -321,9 +325,11 @@ class TestHTTPWeightSynchronizer:
 
 
 class TestCollectiveWeightSynchronizer:
+    @patch("nemo_rl.utils.refit_orchestration.ray")
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
-    def test_sync_weights_calls_broadcast_and_receive(self, mock_ray):
+    def test_sync_weights_calls_broadcast_and_receive(self, mock_ray, mock_refit_ray):
         mock_ray.get.return_value = [True]
+        mock_refit_ray.get.return_value = None
         policy = _mock_policy()
         gen = _mock_generation()
         train_cluster = _mock_cluster(world_size=4)
@@ -339,9 +345,11 @@ class TestCollectiveWeightSynchronizer:
         policy.broadcast_weights_for_collective.assert_called_once()
         gen.update_weights_from_collective.assert_called_once()
 
+    @patch("nemo_rl.utils.refit_orchestration.ray")
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
-    def test_sync_weights_passes_kv_scales(self, mock_ray):
+    def test_sync_weights_passes_kv_scales(self, mock_ray, mock_refit_ray):
         mock_ray.get.return_value = [True]
+        mock_refit_ray.get.return_value = None
         policy = _mock_policy()
         gen = _mock_generation()
         sync = CollectiveWeightSynchronizer(
@@ -353,12 +361,11 @@ class TestCollectiveWeightSynchronizer:
         call_kwargs = policy.broadcast_weights_for_collective.call_args
         assert call_kwargs.kwargs["kv_scales"] == kv_scales
 
+    @patch("nemo_rl.utils.refit_orchestration.ray")
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
-    def test_sync_weights_raises_on_failure(self, mock_ray):
-        mock_ray.get.side_effect = [
-            None,  # futures_train
-            [False],  # futures_inference -- update failed
-        ]
+    def test_sync_weights_raises_on_failure(self, mock_ray, mock_refit_ray):
+        mock_refit_ray.get.return_value = None
+        mock_ray.get.return_value = [False]
         policy = _mock_policy()
         gen = _mock_generation()
         sync = CollectiveWeightSynchronizer(
@@ -389,6 +396,38 @@ class TestCollectiveWeightSynchronizer:
         gen.init_collective.assert_called_once_with(
             "10.0.0.1", 29500, 6, train_world_size=4
         )
+
+
+# ---------------------------------------------------------------------------
+# VllmHTTPSparseWeightSynchronizer
+# ---------------------------------------------------------------------------
+
+
+class TestVllmHTTPSparseWeightSynchronizer:
+    @patch("nemo_rl.weight_sync.vllm_http_sparse_weight_synchronizer.ray")
+    @patch(
+        "nemo_rl.weight_sync.vllm_http_sparse_weight_synchronizer.check_vllm_refit_health"
+    )
+    def test_init_failure_clears_baseline_refs(self, mock_health, mock_ray):
+        mock_health.side_effect = RuntimeError("receiver is down")
+        baseline_ref = MagicMock()
+        policy = _mock_policy()
+        policy.init_remote_sparse_delta_baseline.return_value = [baseline_ref]
+        gen = _mock_generation()
+        sync = VllmHTTPSparseWeightSynchronizer(
+            policy,
+            gen,
+            refit_urls=["http://receiver:8000"],
+        )
+
+        with pytest.raises(RuntimeError, match="receiver is down"):
+            sync.init_communicator()
+
+        mock_ray.cancel.assert_called_once_with(baseline_ref, force=True)
+        assert sync._baseline_init_refs is None
+        assert sync._refit_urls == []
+        assert not sync.is_initialized
+        assert sync.is_stale
 
 
 # ---------------------------------------------------------------------------

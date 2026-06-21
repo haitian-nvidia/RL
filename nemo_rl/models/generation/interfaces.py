@@ -272,6 +272,9 @@ class GenerationInterface(ABC):
     def invalidate_kv_cache(self) -> bool:
         return False
 
+    def report_refit_server_base_urls(self) -> list[str]:
+        return []
+
     def clear_logger_metrics(self) -> None:
         """Clear logger metrics for performance reporting.
 

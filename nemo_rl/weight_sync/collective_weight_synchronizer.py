@@ -33,6 +33,9 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.utils.refit_orchestration import (
+    queue_baseline_prewarm_after_source_broadcast,
+)
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -75,13 +78,18 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             if timer is not None
             else nullcontext()
         )
+
         with timer_context:
             futures_train = self._policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales
             )
             futures_inference = self._generation.update_weights_from_collective()
 
-            ray.get(futures_train)
+            queue_baseline_prewarm_after_source_broadcast(
+                self._policy,
+                futures_train,
+                kv_scales=kv_scales,
+            )
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
 
@@ -102,6 +110,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._stale = True
 
     def init_communicator(self) -> None:
+        # prepare_refit_info is called before init_collective. This matches
+        # distillation.py ordering. Neither call depends on the other today,
+        # but we document this as the canonical ordering for future reference.
         state_dict_info = self._policy.prepare_refit_info()
         self._generation.prepare_refit_info(state_dict_info)
 

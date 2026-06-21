@@ -12,11 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import copy
 import gc
+import json
 import logging
 import os
 import sys
+import threading
+import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Optional, cast
 
 import ray
@@ -25,8 +31,12 @@ from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
+    _get_free_port_local,
+    _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
@@ -44,6 +54,26 @@ from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+from nemo_rl.utils.weight_transfer_http import (
+    G_VLLM_GENERATE_PATH,
+    G_VLLM_REFIT_ASYNC_RECEIVER_APPLY_ENV,
+    G_VLLM_REFIT_FLUSH_PATH,
+    G_VLLM_REFIT_HEALTH_PATH,
+    G_VLLM_REFIT_SPARSE_DELTA_PATH,
+    decode_vllm_refit_request_body,
+    vllm_refit_api_key_is_valid,
+)
+from nemo_rl.utils.weight_transfer_protocol import (
+    G_REFIT_DIRECT_SPARSE_VLLM_LOAD_ENV,
+    config_env_flag,
+    config_to_dict,
+    env_int,
+    is_refit_receiver_timing,
+)
+
+_REFIT_APPLY_QUEUE_INIT_LOCK = threading.Lock()
+G_VLLM_REFIT_RECEIVER_APPLY_QUEUE_DEPTH_ENV = "NRL_REFIT_RECEIVER_APPLY_QUEUE_DEPTH"
+G_DEFAULT_VLLM_REFIT_RECEIVER_APPLY_QUEUE_DEPTH = 1
 
 logger = logging.getLogger(__name__)
 
@@ -534,10 +564,287 @@ class BaseVllmGenerationWorker:
         return metrics
 
     def _get_delta_load_batch_size_bytes(self) -> int | None:
-        delta_config = self.cfg.get("delta_compression")
-        if delta_config is None or not delta_config["enabled"]:
+        delta_config = self._delta_config_dict()
+        if not delta_config or not delta_config.get("enabled", False):
             return None
         return int(delta_config["delta_load_batch_size_bytes"])
+
+    def _delta_config_dict(self) -> dict[str, Any]:
+        return config_to_dict(self.cfg.get("delta_compression"))
+
+    def _use_direct_sparse_delta_load(self) -> bool:
+        return config_env_flag(
+            self._delta_config_dict(),
+            "direct_sparse_vllm_load",
+            env_name=G_REFIT_DIRECT_SPARSE_VLLM_LOAD_ENV,
+            default=True,
+        )
+
+    def _use_async_refit_apply_queue(self) -> bool:
+        return config_env_flag(
+            self._delta_config_dict(),
+            "async_receiver_apply",
+            env_name=G_VLLM_REFIT_ASYNC_RECEIVER_APPLY_ENV,
+            default=True,
+        ) and not bool(self.cfg["vllm_cfg"]["async_engine"])
+
+    def _refit_apply_queue_depth(self) -> int:
+        return env_int(
+            G_VLLM_REFIT_RECEIVER_APPLY_QUEUE_DEPTH_ENV,
+            default=G_DEFAULT_VLLM_REFIT_RECEIVER_APPLY_QUEUE_DEPTH,
+            min_value=1,
+        )
+
+    def _ensure_refit_apply_queue(
+        self,
+    ) -> tuple[threading.Lock, ThreadPoolExecutor, deque[Future]]:
+        lock = getattr(self, "_refit_apply_queue_lock", None)
+        if lock is None:
+            with _REFIT_APPLY_QUEUE_INIT_LOCK:
+                lock = getattr(self, "_refit_apply_queue_lock", None)
+                if lock is None:
+                    self._refit_apply_queue_lock = lock = threading.Lock()
+                    self._refit_apply_executor = ThreadPoolExecutor(max_workers=1)
+                    self._refit_apply_futures = deque()
+        return lock, self._refit_apply_executor, self._refit_apply_futures
+
+    def _enqueue_sparse_payload_apply(self, body: bytes) -> dict[str, Any]:
+        lock, executor, futures = self._ensure_refit_apply_queue()
+        max_depth = self._refit_apply_queue_depth()
+        timing: dict[str, float] = {}
+        errors: list[dict[str, Any]] = []
+        payloads = 0
+        wait_s = 0.0
+        with lock:
+            while futures and (futures[0].done() or len(futures) >= max_depth):
+                started = time.perf_counter()
+                payloads += 1
+                errors.extend(
+                    self._collect_refit_apply_result(futures.popleft(), timing)
+                )
+                wait_s += time.perf_counter() - started
+            futures.append(executor.submit(self._apply_sparse_payload_for_queue, body))
+            depth = len(futures)
+        response = {"ok": not errors, "queued": True, "queue_depth": depth}
+        if wait_s:
+            response["backpressure_wait_s"] = wait_s
+        if payloads:
+            response["payloads"] = payloads
+            response.update(timing)
+        if errors:
+            response["errors"] = errors
+        return response
+
+    @staticmethod
+    def _collect_refit_apply_result(
+        future: Future, timing: dict[str, float]
+    ) -> list[dict[str, Any]]:
+        try:
+            result = future.result()
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        if not isinstance(result, dict):
+            result = {"ok": bool(result)}
+        for key, value in result.items():
+            if is_refit_receiver_timing(key, value):
+                timing[key] = timing.get(key, 0.0) + float(value)
+        return [] if result.get("ok", False) else [result]
+
+    @staticmethod
+    def _refit_worker_timing_from_results(
+        worker_results: list[Any],
+    ) -> dict[str, float]:
+        timing: dict[str, float] = {}
+        for result in worker_results:
+            if isinstance(result, dict):
+                for key, value in result.items():
+                    if is_refit_receiver_timing(key, value):
+                        timing[key] = max(timing.get(key, 0.0), float(value))
+        return timing
+
+    @classmethod
+    def _refit_collective_response(cls, worker_results: Any) -> dict[str, Any]:
+        if not isinstance(worker_results, list):
+            worker_results = [worker_results]
+        ok = all(
+            result is True or (isinstance(result, dict) and result.get("ok"))
+            for result in worker_results
+        )
+        response = {"ok": ok, "workers": worker_results}
+        response.update(cls._refit_worker_timing_from_results(worker_results))
+        return response
+
+    def _flush_queued_sparse_payloads(self) -> dict[str, Any]:
+        started = time.perf_counter()
+        lock = getattr(self, "_refit_apply_queue_lock", None)
+        if lock is None:
+            sync_result = self._synchronize_refit_apply_workers()
+            response = {
+                "ok": sync_result.get("ok", True),
+                "queued": False,
+                "payloads": 0,
+                "seconds": time.perf_counter() - started,
+            }
+            response.update(
+                {k: v for k, v in sync_result.items() if is_refit_receiver_timing(k, v)}
+            )
+            return response
+        with lock:
+            futures = list(self._refit_apply_futures)
+            self._refit_apply_futures.clear()
+        timing: dict[str, float] = {}
+        errors: list[dict[str, Any]] = []
+        for future in futures:
+            errors.extend(self._collect_refit_apply_result(future, timing))
+        if futures and not errors:
+            sync_result = self._synchronize_refit_apply_workers()
+            if not sync_result.get("ok", False):
+                errors.append(sync_result)
+            timing.update(
+                {k: v for k, v in sync_result.items() if is_refit_receiver_timing(k, v)}
+            )
+        response = {
+            "ok": not errors,
+            "queued": True,
+            "payloads": len(futures),
+            "seconds": time.perf_counter() - started,
+        }
+        response.update(timing)
+        if errors:
+            response["errors"] = errors
+        if futures:
+            print(
+                "REFIT_RECEIVER_TIMING "
+                f"payloads={len(futures)} total_s={response['seconds']:.3f} "
+                f"payload_total_s={timing.get('receiver_total_s', 0.0):.3f}",
+                flush=True,
+            )
+        return response
+
+    def _synchronize_refit_apply_workers(self) -> dict[str, Any]:
+        llm = getattr(self, "llm", None)
+        if llm is None:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            return {"ok": True}
+        return self._refit_collective_response(
+            llm.collective_rpc("synchronize_device", args=())
+        )
+
+    def _shutdown_refit_apply_queue(self) -> bool:
+        executor = getattr(self, "_refit_apply_executor", None)
+        if executor is None:
+            return True
+        result = self._flush_queued_sparse_payloads()
+        executor.shutdown(wait=True)
+        for attr in (
+            "_refit_apply_queue_lock",
+            "_refit_apply_executor",
+            "_refit_apply_futures",
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        return bool(result.get("ok", False))
+
+    def _apply_sparse_payload_for_queue(self, body: bytes) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _setup_vllm_refit_api_server(self, app) -> Any:
+        from fastapi import Request
+        from fastapi.responses import JSONResponse
+
+        token_env_var = self.cfg["vllm_cfg"].get("http_refit_api_key_env_var")
+
+        def token_is_valid(raw_request: Request) -> bool:
+            return vllm_refit_api_key_is_valid(token_env_var, raw_request.headers)
+
+        def json_response(result: dict[str, Any]) -> JSONResponse:
+            return JSONResponse(
+                content=result,
+                status_code=200 if result.get("ok", False) else 500,
+            )
+
+        def unauthorized_response() -> JSONResponse:
+            return JSONResponse(
+                content={"ok": False, "error": "unauthorized"}, status_code=403
+            )
+
+        @app.get(G_VLLM_REFIT_HEALTH_PATH)
+        async def refit_health() -> dict[str, Any]:
+            return {"ok": True}
+
+        @app.post(G_VLLM_REFIT_SPARSE_DELTA_PATH)
+        async def apply_sparse_delta_refit(raw_request: Request) -> JSONResponse:
+            if not token_is_valid(raw_request):
+                return unauthorized_response()
+            body = await raw_request.body()
+            try:
+                body = decode_vllm_refit_request_body(body, raw_request.headers)
+            except ValueError as exc:
+                return json_response({"ok": False, "error": str(exc)})
+            if self._use_async_refit_apply_queue():
+                result = await asyncio.to_thread(
+                    self._enqueue_sparse_payload_apply, body
+                )
+            else:
+                result = await self._apply_sparse_payload(body)
+            return json_response(result)
+
+        @app.post(G_VLLM_REFIT_FLUSH_PATH)
+        async def flush_sparse_delta_refit(raw_request: Request) -> JSONResponse:
+            if not token_is_valid(raw_request):
+                return unauthorized_response()
+            result = await asyncio.to_thread(self._flush_queued_sparse_payloads)
+            return json_response(result)
+
+        @app.post(G_VLLM_GENERATE_PATH)
+        async def generate_http(raw_request: Request) -> JSONResponse:
+            if not token_is_valid(raw_request):
+                return unauthorized_response()
+            try:
+                payload = json.loads((await raw_request.body()).decode("utf-8"))
+                result = await asyncio.to_thread(self._generate_http_payload, payload)
+            except Exception as exc:
+                return json_response({"ok": False, "error": str(exc)})
+            return json_response(result)
+
+        return app
+
+    def _generate_http_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        input_ids = payload.get("input_ids")
+        input_lengths = payload.get("input_lengths")
+        if not isinstance(input_ids, list) or not isinstance(input_lengths, list):
+            raise TypeError("Generation payload requires input_ids and input_lengths")
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                "input_lengths": torch.tensor(input_lengths, dtype=torch.int32),
+            }
+        )
+        if isinstance(payload.get("stop_strings"), list):
+            data["stop_strings"] = payload["stop_strings"]
+        result = self.generate(data, greedy=bool(payload.get("greedy", False)))
+        return {
+            "ok": True,
+            "output_ids": result["output_ids"].detach().cpu().tolist(),
+            "logprobs": result["logprobs"].detach().cpu().tolist(),
+            "generation_lengths": result["generation_lengths"].detach().cpu().tolist(),
+            "unpadded_sequence_lengths": result["unpadded_sequence_lengths"]
+            .detach()
+            .cpu()
+            .tolist(),
+            "truncated": result["truncated"].detach().cpu().tolist(),
+        }
+
+    async def _apply_sparse_payload(self, body: bytes) -> dict[str, Any]:
+        """Apply a serialized sparse-delta refit payload.
+
+        Overridden per worker to dispatch to the sync or async update path.
+        """
+        raise NotImplementedError
+
+    def report_refit_server_base_url(self) -> str | None:
+        return getattr(self, "refit_server_base_url", None)
 
 
 class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
@@ -548,6 +855,47 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
+        if self.cfg["vllm_cfg"].get("expose_http_refit_server", False):
+            self._setup_vllm_refit_server()
+
+    def _setup_vllm_refit_server(self) -> None:
+        import uvicorn
+        from fastapi import FastAPI
+
+        app = self._setup_vllm_refit_api_server(FastAPI())
+        fixed_port = self.cfg["vllm_cfg"].get("http_refit_server_port")
+        if fixed_port is None:
+            port_range_low = self.cfg.get(
+                "port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW
+            )
+            port_range_high = self.cfg.get(
+                "port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH
+            )
+            fixed_port = _get_free_port_local(port_range_low, port_range_high)
+        node_ip = _get_node_ip_local()
+        base_url = f"http://{node_ip}:{fixed_port}"
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=int(fixed_port),
+            timeout_keep_alive=120,
+        )
+        server = uvicorn.Server(config=config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        self.refit_server_base_url = base_url
+        self.refit_server = server
+        self.refit_server_thread = thread
+        print(f"Starting vLLM refit server on {base_url}", flush=True)
+
+    async def _apply_sparse_payload(self, body: bytes) -> dict[str, Any]:
+        return self.update_weights_from_serialized_sparse_payload(body)
+
+    def _apply_sparse_payload_for_queue(self, body: bytes) -> dict[str, Any]:
+        return self.update_weights_from_serialized_sparse_payload(
+            body,
+            synchronize=False,
+        )
 
     def init_collective(
         self,
@@ -556,6 +904,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         port: int,
         world_size: int,
         train_world_size: int,
+        local_world_size: int,
     ) -> None:
         self.llm.collective_rpc(
             "init_collective",
@@ -565,6 +914,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 port,
                 world_size,
                 train_world_size,
+                local_world_size,
             ),
         )
 
@@ -844,7 +1194,11 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         """Prepare the info for refit."""
         self.llm.collective_rpc(
             "prepare_refit_info",
-            args=(state_dict_info, self._get_delta_load_batch_size_bytes()),
+            args=(
+                state_dict_info,
+                self._get_delta_load_batch_size_bytes(),
+                self._use_direct_sparse_delta_load(),
+            ),
         )
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
@@ -909,6 +1263,39 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
 
             traceback.print_exc()
             return False
+
+    def update_weights_from_serialized_sparse_payload(
+        self,
+        serialized_payload: bytes,
+        *,
+        synchronize: bool = True,
+    ) -> dict[str, Any]:
+        """Apply one HTTP sparse-delta payload through sync vLLM collective_rpc."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM "
+                "or non-model-owner"
+            )
+
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "Sync HTTP sparse refit requires async_engine=False."
+                )
+
+            rpc_args = (
+                (serialized_payload,) if synchronize else (serialized_payload, False)
+            )
+            worker_results = self.llm.collective_rpc(
+                "update_weights_from_serialized_sparse_payload",
+                args=rpc_args,
+            )
+            return self._refit_collective_response(worker_results)
+        except Exception as e:
+            print(f"Exception during HTTP sparse refit weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return {"ok": False, "error": str(e)}
 
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
@@ -975,6 +1362,16 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            refit_server = getattr(self, "refit_server", None)
+            if refit_server is not None:
+                refit_server.should_exit = True
+
+            queue_shutdown_ok = self._shutdown_refit_apply_queue()
+
+            refit_server_thread = getattr(self, "refit_server_thread", None)
+            if refit_server_thread is not None:
+                refit_server_thread.join(timeout=5.0)
+
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 self.llm.collective_rpc("cleanup", args=tuple())
@@ -989,7 +1386,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             gc.collect()
             torch.cuda.empty_cache()
 
-            return True
+            return queue_shutdown_ok
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
