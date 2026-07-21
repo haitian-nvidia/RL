@@ -37,6 +37,8 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import traceback
+import uuid
 import warnings
 from typing import Any, Optional, Union, cast
 
@@ -510,12 +512,27 @@ class SingleControllerActor:
             prompt: DatumSpec, target_step: Optional[int]
         ) -> None:
             self._inflight_rollouts += 1
+            group_id = str(uuid.uuid4())
             try:
                 await self._rollout_manager.generate_and_push(
                     prompt,
                     num_generations_per_prompt=num_generations_per_prompt,
                     target_step=target_step,
+                    group_id=group_id,
                 )
+            except Exception:
+                # Failed dispatch: drop the reserved slot and return its
+                # capacity permit so the pump admits a substitute prompt (this
+                # prompt is lost for the epoch). release() returning False
+                # means the staleness window evicted the slot while the
+                # rollout was in flight — evict already released the permit,
+                # so releasing again here would double-count capacity.
+                # CancelledError (BaseException) deliberately passes through:
+                # shutdown cancellation keeps its semantics.
+                traceback.print_exc()
+                if self._buffer.release(group_id):
+                    self._buffer_capacity.release()
+            else:
                 if self._diagnostics:
                     content = ""
                     for i in range(len(prompt["message_log"])):

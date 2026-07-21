@@ -729,6 +729,7 @@ class RolloutManager:
         *,
         num_generations_per_prompt: int,
         target_step: Optional[int] = None,
+        group_id: Optional[str] = None,
     ) -> None:
         """Reserve a buffer slot, run one prompt's rollout, then commit the slot.
 
@@ -736,6 +737,9 @@ class RolloutManager:
             input_sample: A single prompt (one DatumSpec entry).
             num_generations_per_prompt: Number of completions to generate.
             target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
+            group_id: Optional caller-supplied id for the reserved slot so the
+                caller can roll the slot back via TQReplayBuffer.release when
+                this call raises; defaults to a fresh uuid inside reserve.
         """
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -745,7 +749,7 @@ class RolloutManager:
         )
         start_version = self._weight_version
         group_id = self._tq_buffer.reserve(
-            weight_version=start_version, target_step=target_step
+            weight_version=start_version, target_step=target_step, group_id=group_id
         )
 
         record = await self.run_rollout(

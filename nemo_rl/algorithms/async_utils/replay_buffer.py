@@ -687,6 +687,39 @@ class TQReplayBuffer:
         self._group_ids.append(group_id)
         return group_id
 
+    def release(self, group_id: str) -> bool:
+        """Roll back an uncommitted reserve slot (failed-rollout cleanup).
+
+        An unready slot has meta=None, so there are no DataPlane rows to clear.
+
+        Args:
+            group_id: group_id returned by the matching reserve call.
+
+        Returns:
+            True if a live slot was removed. False if no slot exists for
+            group_id — the staleness window evicted it while the rollout was
+            in flight, and evict already returned its capacity permit, so
+            callers must NOT release the permit again on False.
+
+        Raises:
+            AssertionError: the slot is already committed (ready); committed
+                groups leave the buffer via remove()/select, never rollback.
+        """
+        try:
+            idx = self._group_ids.index(group_id)
+        except ValueError:
+            return False
+        assert not self.ready_list[idx], (
+            f"release() is only for uncommitted slots; {group_id} is ready"
+        )
+        del self.meta_list[idx]
+        del self.start_weight_list[idx]
+        del self.end_weight_list[idx]
+        del self.target_step_list[idx]
+        del self.ready_list[idx]
+        del self._group_ids[idx]
+        return True
+
     async def commit(
         self,
         group_id: str,
@@ -707,8 +740,19 @@ class TQReplayBuffer:
             KVBatchMeta for the committed group.
 
         Raises:
-            ValueError: group_id has no live slot (removed or never reserved).
+            ValueError: group_id has no live slot (evicted while the rollout
+                was in flight, or never reserved). Detected up front the
+                trajectory is dropped BEFORE any DataPlane write; if the slot
+                disappears during the put_samples await instead, the
+                just-written rows are cleared before raising so no orphan
+                rows leak.
         """
+        if group_id not in self._group_ids:
+            raise ValueError(
+                f"TQReplayBuffer.commit: no live slot for group {group_id} "
+                f"(evicted while in flight); dropping trajectory without "
+                f"writing DataPlane rows"
+            )
         train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=start_weight_version, group_id=group_id
@@ -720,6 +764,20 @@ class TQReplayBuffer:
             fields=fields,
             tags=tags,
         )
+        # evict can run during the put_samples await (same event loop) and
+        # drop this slot with meta still None, collecting no sample_ids to
+        # clear — undo the write here so the rows are not orphaned.
+        if group_id not in self._group_ids:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=list(sample_ids),
+                partition_id=self._partition_id,
+            )
+            raise ValueError(
+                f"TQReplayBuffer.commit: slot for group {group_id} was "
+                f"evicted during the DataPlane write; rows cleared, "
+                f"trajectory dropped"
+            )
 
         # mirrors kv_first_write
         lengths = train_batch["input_lengths"]
